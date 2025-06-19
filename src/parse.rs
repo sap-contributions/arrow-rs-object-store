@@ -76,6 +76,8 @@ pub enum ObjectStoreScheme {
     MicrosoftAzure,
     /// Url corresponding to [`HttpStore`](crate::http::HttpStore)
     Http,
+    /// Url corresponding to [`SAPHdlfs`](crate::hdlfs::SAPHdlfs)
+    SAPHdlfs,
 }
 
 impl ObjectStoreScheme {
@@ -112,6 +114,7 @@ impl ObjectStoreScheme {
             ("gs", Some(_)) => (Self::GoogleCloudStorage, url.path()),
             ("az", Some(_)) => (Self::MicrosoftAzure, strip_bucket().unwrap_or_default()),
             ("adl" | "azure" | "abfs" | "abfss", Some(_)) => (Self::MicrosoftAzure, url.path()),
+            ("hdlfs", Some(_)) => (Self::SAPHdlfs, url.path()),
             ("http", Some(_)) => (Self::Http, url.path()),
             ("https", Some(host)) => {
                 if host.ends_with("dfs.core.windows.net")
@@ -218,11 +221,16 @@ where
             let url = &url[..url::Position::BeforePath];
             builder_opts!(crate::http::HttpBuilder, url, _options)
         }
+        #[cfg(feature = "hdlfs")]
+        ObjectStoreScheme::SAPHdlfs => {
+            builder_opts!(crate::hdlfs::SAPHdlfsBuilder, url, _options)
+        }
         #[cfg(not(all(
             feature = "aws",
             feature = "azure",
             feature = "gcp",
             feature = "http",
+            feature = "hdlfs",
             not(target_arch = "wasm32")
         )))]
         s => {
