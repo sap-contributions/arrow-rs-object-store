@@ -43,8 +43,8 @@ mod list;
 const STORE: &str = "HDLFS";
 
 macro_rules! trace_api_call {
-    ($cond:expr, $($arg:tt)*) => {
-        if $cond {
+    ($obj:expr, $($arg:tt)*) => {
+        if $obj.need_trace() {
             let thread_id = std::thread::current().id();
             eprintln!("[thread: {:>3?}] {}", thread_id, format!($($arg)*));
         }
@@ -55,6 +55,12 @@ macro_rules! trace_api_call {
 #[derive(Debug)]
 pub struct SAPHdlfs {
     client: Arc<SAPHdlfsClient>,
+}
+
+impl SAPHdlfs {
+    pub(crate) fn need_trace(&self) -> bool {
+        self.client.need_trace()
+    }
 }
 
 #[async_trait]
@@ -69,7 +75,7 @@ impl ObjectStore for SAPHdlfs {
         let result = self.client.put_blob(location, payload, opts).await;
         let duration = start.elapsed();
         trace_api_call!(
-            self.client.need_trace(),
+            self,
             "<< put_opts end, path: {}, took: {} ms",
             location,
             duration.as_millis()
@@ -94,7 +100,7 @@ impl ObjectStore for SAPHdlfs {
         });
         let duration = start.elapsed();
         trace_api_call!(
-            self.client.need_trace(),
+            self,
             "<< put_multipart_opts end, path: {}, took: {} ms",
             location,
             duration.as_millis()
@@ -111,7 +117,7 @@ impl ObjectStore for SAPHdlfs {
         let result = self.client.get_opts(location, options).await;
         let duration = start.elapsed();
         trace_api_call!(
-            self.client.need_trace(),
+            self,
             "<< get_opts end, path: {}, length: {:>8}, took: {} ms",
             location,
             length,
@@ -125,7 +131,7 @@ impl ObjectStore for SAPHdlfs {
         let result = self.client.delete_request(location, &()).await;
         let duration = start.elapsed();
         trace_api_call!(
-            self.client.need_trace(),
+            self,
             "<< delete end, path: {}, took: {} ms",
             location,
             duration.as_millis()
@@ -135,11 +141,7 @@ impl ObjectStore for SAPHdlfs {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let prefix_str = prefix.map(|p| p.to_string()).unwrap_or_default();
-        trace_api_call!(
-            self.client.need_trace(),
-            ">> list start, prefix: {}",
-            prefix_str
-        );
+        trace_api_call!(self, ">> list start, prefix: {}", prefix_str);
         let stream = self.client.list(prefix);
         Box::pin(stream)
     }
@@ -150,7 +152,7 @@ impl ObjectStore for SAPHdlfs {
         let result = self.client.list_with_delimiter(prefix).await;
         let duration = start.elapsed();
         trace_api_call!(
-            self.client.need_trace(),
+            self,
             "<< list_with_delimiter end, prefix: {}, took: {} ms",
             prefix_str,
             duration.as_millis()
@@ -163,7 +165,7 @@ impl ObjectStore for SAPHdlfs {
         let result = self.client.copy_request(from, to, true).await;
         let duration = start.elapsed();
         trace_api_call!(
-            self.client.need_trace(),
+            self,
             "<< copy end, from: {}, to: {}, took: {} ms",
             from,
             to,
@@ -177,7 +179,7 @@ impl ObjectStore for SAPHdlfs {
         let result = self.client.copy_request(from, to, false).await;
         let duration = start.elapsed();
         trace_api_call!(
-            self.client.need_trace(),
+            self,
             "<< copy_if_not_exists end, from: {}, to: {}, took: {} ms",
             from,
             to,
@@ -218,7 +220,7 @@ impl MultipartUpload for crate::hdlfs::SAPHdlfsMultiPartUpload {
             let result = state.client.put_block(&state.location, idx, data).await;
             let duration = start.elapsed();
             trace_api_call!(
-                state.client.need_trace(),
+                state.client,
                 "<< put_part end, path: {} part_idx: {}, took: {} ms",
                 &state.location,
                 idx,
@@ -240,7 +242,7 @@ impl MultipartUpload for crate::hdlfs::SAPHdlfsMultiPartUpload {
             .await;
         let duration = start.elapsed();
         trace_api_call!(
-            self.state.client.need_trace(),
+            self.state.client,
             "<< complete end, path: {} part_idx: {}, took: {} ms",
             &self.state.location,
             self.part_idx,
@@ -271,7 +273,7 @@ impl MultipartStore for crate::hdlfs::SAPHdlfs {
         let result = self.client.put_block(path, part_idx, data).await;
         let duration = start.elapsed();
         trace_api_call!(
-            self.client.need_trace(),
+            self,
             "<< put_part end, path: {} part_idx: {}, took: {} ms",
             path,
             part_idx,
@@ -293,7 +295,7 @@ impl MultipartStore for crate::hdlfs::SAPHdlfs {
             .await;
         let duration = start.elapsed();
         trace_api_call!(
-            self.client.need_trace(),
+            self,
             "<< complete_multipart end, path: {}, took: {} ms",
             path,
             duration.as_millis()
