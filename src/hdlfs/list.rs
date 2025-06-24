@@ -27,6 +27,9 @@ pub(crate) struct DirectoryListing {
 pub(crate) struct PartialListing {
     #[serde(rename = "partialListing")]
     pub partial_listing: FileStatusesWrapper,
+
+    #[serde(rename = "pageId")]
+    pub page_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,4 +82,37 @@ pub(super) struct DeleteFile {
 #[derive(Serialize, Deserialize)]
 pub(super) struct BatchDeleteWrapper {
     pub files: Vec<DeleteFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NonRecursiveDirectoryListing {
+    #[serde(rename = "FileStatuses")]
+    pub file_statuses: NonRecursiveFileStatuses,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NonRecursiveFileStatuses {
+    #[serde(rename = "FileStatus")]
+    pub file_status: Vec<NonRecursiveFileStatus>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NonRecursiveFileStatus {
+    #[serde(rename = "pathSuffix")]
+    pub path_suffix: String,
+    #[serde(rename = "type")]
+    pub file_type: String,
+    pub length: u64,
+    pub owner: String,
+    pub group: String,
+    pub permission: String,
+    #[serde(rename = "accessTime")]
+    pub access_time: u64,
+    #[serde(rename = "blockSize")]
+    pub block_size: u64,
+    pub replication: u32,
+    #[serde(rename = "eTag")]
+    pub e_tag: Option<String>,
+    #[serde(rename = "modificationTime")]
+    pub modification_time: i64,
 }
