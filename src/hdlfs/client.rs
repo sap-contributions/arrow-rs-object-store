@@ -647,7 +647,6 @@ impl ListClient for Arc<SAPHdlfsClient> {
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
         let mut start_after: Option<String> = None;
-        let mut latest_count: u64 = 0;
         let mut loop_count = 0;
 
         loop {
@@ -704,7 +703,8 @@ impl ListClient for Arc<SAPHdlfsClient> {
 
             trace_log!(
                 self,
-                "list_request parsed DirectoryListing page_id: {:?}",
+                "list_request loop_count:{}, page_id: {:?}",
+                loop_count,
                 dir_listing.directory_listing.page_id
             );
 
@@ -739,19 +739,11 @@ impl ListClient for Arc<SAPHdlfsClient> {
 
             // Get the next page_id
             let page_id = dir_listing.directory_listing.page_id.clone();
-            let new_count = (objects.len() + common_prefixes.len()) as u64;
-            trace_log!(
-                self,
-                "list_request , new_count:{} , latest_count:{}",
-                new_count,
-                latest_count
-            );
-            if page_id.is_none() || latest_count == new_count || loop_count >= 10 {
+            if page_id.is_none() {
                 break;
             }
 
             start_after = page_id;
-            latest_count = new_count;
             loop_count += 1;
         }
 
