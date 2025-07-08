@@ -163,7 +163,7 @@ impl FromStr for SAPHdlfsConfigKey {
         match s.to_ascii_lowercase().as_str() {
             "hdlfs_storage_private_key" | "private_key" => Ok(Self::PrivateKey),
             "hdlfs_storage_certificate" | "certificate" => Ok(Self::Certificate),
-            "hdlfs_storage_endpoint" | "domain" => Ok(Self::Endpoint),
+            "hdlfs_storage_endpoint" | "endpoint" => Ok(Self::Endpoint),
             "hdlfs_container_id" | "container_id" => Ok(Self::ContainerId),
             "hdlfs_storage_use_emulator" | "use_emulator" => Ok(Self::UseEmulator),
             "hdlfs_storage_trace" | "trace" => Ok(Self::Trace),
@@ -272,6 +272,12 @@ impl SAPHdlfsBuilder {
         self
     }
 
+    /// Sets whether to enable tracing for the client.
+    pub fn with_trace(mut self, trace: bool) -> Self {
+        self.trace = trace.into();
+        self
+    }
+    
     /// Set the retry configuration
     pub fn with_retry(mut self, retry_config: RetryConfig) -> Self {
         self.retry_config = retry_config;
