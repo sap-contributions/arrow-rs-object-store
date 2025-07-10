@@ -354,7 +354,7 @@ impl SAPHdlfsBuilder {
     /// This is a separate member function to allow fallible computation to
     /// be deferred until [`Self::build`] which in turn allows deriving [`Clone`]
     fn parse_endpoint(&mut self, custom_endpoint: &str) -> Result<()> {
-        eprintln!("custom_endpoint: {}", custom_endpoint);
+        eprintln!("custom_endpoint: [{}]", custom_endpoint);
         let parts: Vec<&str> = custom_endpoint.split('.').collect();
         if parts.len() != 7 {
             return Err(Error::UrlParseError(
@@ -364,6 +364,7 @@ impl SAPHdlfsBuilder {
             .into());
         }
         self.container_id = parts[0].to_string();
+        eprintln!("container_id: [{}]", self.container_id);
         Ok(())
     }
 
@@ -413,7 +414,7 @@ impl SAPHdlfsBuilder {
             .map_err(Error::from)?;
 
         let service_url = format!("https://{}/webhdfs/v1/", self.endpoint);
-        eprintln!("service_url: {}", service_url);
+        eprintln!("service_url: [{}]", service_url);
         let parsed_url = Url::parse(&service_url).map_err(Error::from)?;
 
         let retry_config = RetryConfig {
