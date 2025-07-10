@@ -545,11 +545,7 @@ impl GetClient for SAPHdlfsClient {
         path: &Path,
         options: GetOptions,
     ) -> crate::Result<HttpResponse> {
-        let method = if options.head {
-            Method::HEAD
-        } else {
-            Method::GET
-        };
+        let method = Method::GET;
 
         let mut parameters = vec![("op".to_owned(), "OPEN".to_owned())];
 
