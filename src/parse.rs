@@ -226,6 +226,7 @@ where
             builder_opts!(crate::hdlfs::SAPHdlfsBuilder, url, _options)
         }
         #[cfg(not(all(
+            feature = "fs",
             feature = "aws",
             feature = "azure",
             feature = "gcp",
