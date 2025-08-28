@@ -64,7 +64,8 @@ const HDLFS_BINARY: &str = "application/octet-stream";
 const HDLFS_JSON: &str = "application/json";
 const MAX_OFFSET: &i64 = &(1024 * 1024 * 1024 * 16); // 16 GB
 
-const LIST_DLT_SUFFIX: &str = "__list_delta_table__/";
+const LIST_DLT_SUFFIX1: &str = "__list_delta_table_1__/";
+const LIST_DLT_SUFFIX2: &str = "__list_delta_table_2__/";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -452,19 +453,28 @@ impl SAPHdlfsClient {
         }
     }
 
-    async fn list_delta_table(&self, path: &str) -> crate::Result<Vec<Path>> {
+    async fn list_delta_table(&self, path: &str, recursion_depth: usize) -> crate::Result<Vec<Path>> {
         let mut tab_list = Vec::new();
         let mut stack = vec![path.to_string()];
 
         while let Some(current_path) = stack.pop() {
-            trace_log!(self, "list_delta_table, search path: {}", current_path);
-
             let current_path_obj = Path::from(current_path.clone());
-            let leaf_node = current_path
+            let nth_last_node = current_path
                 .split('/')
                 .filter(|s| !s.is_empty())
-                .last()
+                .rev()
+                .nth(recursion_depth - 1)
                 .unwrap_or("");
+
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            trace_log!(
+                self,
+                "list_delta_table, time:{} search path: {} recursion_depth: {} nth_last_node: {}",
+                now,
+                current_path,
+                recursion_depth,
+                nth_last_node
+            );
 
             // Build the request with required headers and query
             let builder = self
@@ -487,11 +497,6 @@ impl SAPHdlfsClient {
                 .map_err(|e| Error::Http {
                     source: Box::new(e),
                 })?;
-
-            // Print full response body for debugging
-            let body_str = String::from_utf8_lossy(&body_bytes);
-
-            // Parse the nested JSON structure
             let dir_listing: NonRecursiveDirectoryListing = serde_json::from_slice(&body_bytes)
                 .map_err(|source| Error::InvalidListResponseJson { source })?;
 
@@ -501,19 +506,26 @@ impl SAPHdlfsClient {
                     let child_path = f
                         .path_suffix
                         .strip_suffix('/')
-                        .unwrap_or(&f.path_suffix)
-                        .clone();
+                        .unwrap_or(&f.path_suffix);
                     let parent_path = current_path
                         .strip_suffix('/')
-                        .unwrap_or(&current_path)
-                        .clone();
-                    let table_path = Path::from(format!("{}/{}/_table_/", parent_path, child_path));
-                    let next__path = format!("{}/{}/", parent_path, child_path).to_string();
+                        .unwrap_or(&current_path);
 
-                    if leaf_node.len() <= 3 && leaf_node.starts_with("v") {
+                    if child_path == "_error_table_" {
+                        return; // Skip "_error_table_" directories
+                    }
+                    if child_path == "_table_"  {
+                        let table_path = Path::from(format!("{}/{}/", parent_path, child_path));
                         tab_list.push(table_path);
                     } else {
-                        stack.push(next__path);
+                        let table_path = Path::from(format!("{}/{}/_table_/", parent_path, child_path));
+                        let next_path = format!("{}/{}/", parent_path, child_path).to_string();
+
+                        if nth_last_node.len() <= 3 && nth_last_node.starts_with("v") {
+                            tab_list.push(table_path);
+                        } else {
+                            stack.push(next_path);
+                        }
                     }
                 }
             });
@@ -616,21 +628,28 @@ impl ListClient for Arc<SAPHdlfsClient> {
     async fn list_request(
         &self,
         prefix: Option<&str>,
-        opts: PaginatedListOptions,
+        _opts: PaginatedListOptions,
     ) -> Result<PaginatedListResult> {
         let default_prefix = prefix.unwrap_or("/");
-        let sub_path = default_prefix.strip_suffix(LIST_DLT_SUFFIX);
+        let sub_path1 = default_prefix.strip_suffix(LIST_DLT_SUFFIX1);
+        let sub_path2 = default_prefix.strip_suffix(LIST_DLT_SUFFIX2);
         let path = Path::from(default_prefix);
         trace_log!(
             self,
-            "list_request  default_prefix: {:?}  suffix:{} sub_path: {:?}",
+            "list_request  default_prefix: {:?}  sub_path1: {:?}, sub_path2: {:?}",
             default_prefix,
-            LIST_DLT_SUFFIX,
-            sub_path
+            sub_path1,
+            sub_path2
         );
 
-        if sub_path.is_some() {
-            let common_prefixes = self.list_delta_table(sub_path.unwrap()).await?;
+        let (recursion_depth, list_path) = match (sub_path1, sub_path2) {
+            (Some(path), _) => (1, path),
+            (None, Some(path)) => (2, path),
+            _ => (0, ""),
+        };
+
+        if recursion_depth > 0 {
+            let common_prefixes = self.list_delta_table(list_path, recursion_depth).await?;
             return Ok(PaginatedListResult {
                 result: ListResult {
                     common_prefixes: common_prefixes,

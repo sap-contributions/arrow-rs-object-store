@@ -85,19 +85,19 @@ pub(super) struct BatchDeleteWrapper {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NonRecursiveDirectoryListing {
+pub(super) struct NonRecursiveDirectoryListing {
     #[serde(rename = "FileStatuses")]
     pub file_statuses: NonRecursiveFileStatuses,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NonRecursiveFileStatuses {
+pub(super) struct NonRecursiveFileStatuses {
     #[serde(rename = "FileStatus")]
     pub file_status: Vec<NonRecursiveFileStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NonRecursiveFileStatus {
+pub(super) struct NonRecursiveFileStatus {
     #[serde(rename = "pathSuffix")]
     pub path_suffix: String,
     #[serde(rename = "type")]
