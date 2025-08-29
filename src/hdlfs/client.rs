@@ -1114,6 +1114,8 @@ mod tests {
         }
     }
 
+    /// Tests multipart upload completion with trace logging.
+    /// Validates merge operation and cleanup phase execution.
     #[tokio::test]
     async fn test_trace_logging_coverage() {
         use crate::client::mock_server::MockServer;
@@ -1121,29 +1123,25 @@ mod tests {
         use http::Response;
         use url::Url;
 
-        // Create a mock server to simulate successful HTTP responses
         let mock = MockServer::new().await;
 
-        // Configure responses for the two requests in put_block_list:
-        // 1. First request: MERGE operation (POST with op=MERGE)
+        // Mock responses for MERGE and DELETE_BATCH operations
         mock.push(Response::builder()
             .status(200)
             .body("OK".to_string())
             .unwrap());
 
-        // 2. Second request: DELETE_BATCH operation (POST with op=DELETE_BATCH)
         mock.push(Response::builder()
             .status(200)
             .body("OK".to_string())
             .unwrap());
 
-        // Create config with tracing enabled and using mock server URL
         let service_url = Url::parse(mock.url()).unwrap();
         let config = SAPHdlfsConfig::new(
             "test_container".to_string(),
             service_url,
-            false, // emulator
-            true,  // trace enabled - this is crucial!
+            false,
+            true,  // trace enabled
             RetryConfig::default(),
             ClientOptions::default(),
         );
@@ -1151,25 +1149,20 @@ mod tests {
         let http_client = HttpClient::new(reqwest::Client::new());
         let client = SAPHdlfsClient::new(config, http_client);
 
-        // Verify tracing is enabled
         assert!(client.need_trace());
 
-        // Test put_block_list with tracing enabled to cover ALL the code you mentioned:
-        // Lines 354-383 including trace_log!, DeleteFile creation, JSON serialization, etc.
         let path = Path::from("test/trace_block.txt");
         let parts = vec![
             crate::multipart::PartId { content_id: "tmp.a".to_string() },
             crate::multipart::PartId { content_id: "tmp.b".to_string() },
         ];
 
-        // This will now successfully execute BOTH phases:
-        // 1. "phase 1: Merging parts into target path" (line 340-344) + first do_put()
-        // 2. "phase 2: clean up temp files for target path" (line 354-358)
-        // 3. All the cleanup logic (lines 361-383) including the final do_put()
         let result = client.put_block_list(&path, parts, Default::default()).await;
-        assert!(result.is_ok()); // Now should succeed with mock server
+        assert!(result.is_ok());
     }
 
+    /// Tests delta table listing with JSON response parsing.
+    /// Covers directory classification and path processing logic.
     #[tokio::test]
     async fn test_list_delta_table_response_parsing() {
         use crate::client::mock_server::MockServer;
@@ -1177,11 +1170,9 @@ mod tests {
         use http::Response;
         use url::Url;
 
-        // Create mock server for successful response
         let mock = MockServer::new().await;
 
-        // First response for initial request to "test/delta"
-        // This response includes directories that will trigger different code paths
+        // Response with different directory types for testing classification logic
         let first_json_response = r#"{
             "FileStatuses": {
                 "FileStatus": [
@@ -1261,24 +1252,15 @@ mod tests {
         let http_client = HttpClient::new(reqwest::Client::new());
         let client = SAPHdlfsClient::new(config, http_client);
 
-        // Test list_delta_table with recursion_depth=2 to cover:
-        // - Lines 494-499: response.into_body().bytes().await processing
-        // - Line 500-501: JSON deserialization from body_bytes
-        // - Lines 504-531: All directory type handling logic
-        // For path "test/v2" with recursion_depth=2, nth_last_node should be "test"
         let result = client.list_delta_table("test/v2", 2).await;
 
         assert!(result.is_ok());
         let paths = result.unwrap();
-
-        // Verify the logic worked correctly:
-        // - "_error_table_" should be skipped (line 514-516)
-        // - "_table_" should create direct table path (line 517-519)
-        // Since nth_last_node="test" (not starting with "v"), v1 directory should be pushed to stack
-        // This covers both the true and false branches of the version check (line 524-527)
-        assert!(paths.len() >= 1); // Should have at least _table_ path
+        assert!(paths.len() >= 1);
     }
 
+    /// Tests file and directory filtering in list operations.
+    /// Validates ObjectMeta creation and path formatting.
     #[tokio::test]
     async fn test_list_request_file_directory_processing() {
         use crate::client::mock_server::MockServer;
@@ -1291,8 +1273,7 @@ mod tests {
         // Create mock server for successful response
         let mock = MockServer::new().await;
 
-        // Create JSON response that includes both FILES and DIRECTORIES
-        // This will cover lines 734-753 (file and directory processing)
+        // Response with mixed file and directory entries
         let json_response = r#"{
             "DirectoryListing": {
                 "partialListing": {
@@ -1369,31 +1350,25 @@ mod tests {
         let http_client = HttpClient::new(reqwest::Client::new());
         let client = Arc::new(SAPHdlfsClient::new(config, http_client));
 
-        // Test list_request to cover lines 734-753:
-        // - Lines 733-745: objects.extend with FILE filter_map processing
-        // - Lines 747-753: common_prefixes.extend with DIRECTORY filter_map processing
         let result = client.list_request(Some("test/path"), Default::default()).await;
 
         assert!(result.is_ok());
         let paginated_result = result.unwrap();
 
-        // Verify the results:
-        // - Should have 2 files (test_file.txt and another_file.dat)
-        // - Should have 1 directory (test_directory)
         assert_eq!(paginated_result.result.objects.len(), 2);
         assert_eq!(paginated_result.result.common_prefixes.len(), 1);
 
-        // Verify file properties are correctly mapped
         let first_file = &paginated_result.result.objects[0];
         assert_eq!(first_file.size, 1024);
         assert_eq!(first_file.e_tag, Some("abc123".to_string()));
         assert_eq!(first_file.version, Some("v1.0".to_string()));
 
-        // Verify directory path is correctly formatted
         let directory = &paginated_result.result.common_prefixes[0];
         assert!(directory.as_ref().contains("test_directory"));
     }
 
+    /// Tests HTTP response processing for different transfer encodings.
+    /// Validates chunked encoding, missing headers, and normal responses.
     #[tokio::test]
     async fn test_handle_chunked_response_coverage() {
         use crate::client::HttpResponseBody;
@@ -1405,7 +1380,7 @@ mod tests {
         let client = create_test_client(config);
         let test_path = Path::from("test/file.txt");
 
-        // Test 1: Chunked transfer-encoding (lines 429-439)
+        // Test chunked transfer-encoding
         {
             let mut response = Response::new(HttpResponseBody::from(Bytes::from("test content")));
             response.headers_mut().insert(
@@ -1417,14 +1392,11 @@ mod tests {
             assert!(result.is_ok());
             let (parts, _body) = result.unwrap();
 
-            // Verify chunked processing:
-            // - transfer-encoding header should be removed (line 437)
-            // - content-length should be added (line 436)
             assert!(parts.headers.get(TRANSFER_ENCODING).is_none());
             assert!(parts.headers.get(CONTENT_LENGTH).is_some());
         }
 
-        // Test 2: Missing content-length (lines 441-451)
+        // Test missing content-length header
         {
             let response = Response::new(HttpResponseBody::from(Bytes::from("test")));
             // No headers set, so content-length will be missing
@@ -1433,14 +1405,11 @@ mod tests {
             assert!(result.is_ok());
             let (parts, _body) = result.unwrap();
 
-            // Verify missing content-length handling:
-            // - status should be set to GATEWAY_TIMEOUT (line 447)
-            // - content-length should be set to 0 (line 450)
             assert_eq!(parts.status, StatusCode::GATEWAY_TIMEOUT);
             assert_eq!(parts.headers.get(CONTENT_LENGTH).unwrap(), "0");
         }
 
-        // Test 3: Normal response with content-length (line 452)
+        // Test normal response
         {
             let mut response = Response::new(HttpResponseBody::from(Bytes::from("normal content")));
             response.headers_mut().insert(
@@ -1452,9 +1421,6 @@ mod tests {
             assert!(result.is_ok());
             let (parts, _body) = result.unwrap();
 
-            // Verify normal response handling:
-            // - status should remain OK
-            // - content-length should be preserved
             assert_eq!(parts.status, StatusCode::OK);
             assert_eq!(parts.headers.get(CONTENT_LENGTH).unwrap(), "14");
         }
