@@ -116,3 +116,43 @@ pub(super) struct NonRecursiveFileStatus {
     #[serde(rename = "modificationTime")]
     pub modification_time: i64,
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_directory_listing_deserialization() {
+        let json_data = json!({
+            "DirectoryListing": {
+                "partialListing": {
+                    "FileStatuses": {
+                        "FileStatus": [
+                            {
+                                "replication": 1,
+                                "owner": "user",
+                                "length": 1234,
+                                "permission": "rwxr-xr-x",
+                                "type": "FILE",
+                                "version": null,
+                                "blockSize": 4096,
+                                "pathSuffix": "file.txt",
+                                "isDeleted": false,
+                                "modificationTime": 1622547800,
+                                "eTag": null,
+                                "accessTime": 1622547800,
+                                "group": "group"
+                            }
+                        ]
+                    },
+                    "pageId": null
+                }
+            }
+        });
+
+        let listing: DirectoryListing = serde_json::from_value(json_data).unwrap();
+        assert_eq!(listing.directory_listing.partial_listing.file_statuses.file_status.len(), 1);
+    }
+}

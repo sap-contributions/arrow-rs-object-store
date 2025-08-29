@@ -73,3 +73,89 @@ impl SAPHdlfsCredential {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+
+    #[test]
+    fn test_credential_new_and_fields() {
+        let cert = PathBuf::from("cert.pem");
+        let key = PathBuf::from("key.pem");
+        let cred = SAPHdlfsCredential::new(&cert, &key);
+        assert_eq!(cred.cert_path, cert);
+        assert_eq!(cred.key_path, key);
+    }
+
+    #[test]
+    fn test_validate_missing_files() {
+        let cert = PathBuf::from("missing_cert.pem");
+        let key = PathBuf::from("missing_key.pem");
+        let cred = SAPHdlfsCredential::new(&cert, &key);
+        let err = cred.validate().unwrap_err();
+        match err {
+            Error::CertificateNotFound(p) => assert_eq!(p, cert),
+            _ => panic!("Expected CertificateNotFound"),
+        }
+    }
+
+    #[test]
+    fn test_validate_key_missing() {
+        let cert = env::temp_dir().join("test_cert.pem");
+        fs::File::create(&cert).unwrap();
+        let key = PathBuf::from("missing_key.pem");
+        let cred = SAPHdlfsCredential::new(&cert, &key);
+        let err = cred.validate().unwrap_err();
+        match err {
+            Error::KeyNotFound(p) => assert_eq!(p, key),
+            _ => panic!("Expected KeyNotFound"),
+        }
+        let _ = fs::remove_file(&cert);
+    }
+
+    #[test]
+    fn test_validate_success() {
+
+        let cert = env::temp_dir().join("test_cert_validate.pem");
+        let key = env::temp_dir().join("test_key_validate.pem");
+
+        // Create files with content to ensure they exist
+        use std::io::Write;
+        let mut cert_file = fs::File::create(&cert).expect("Failed to create cert file");
+        cert_file.write_all(b"dummy cert content").expect("Failed to write cert");
+        cert_file.sync_all().expect("Failed to sync cert");
+        drop(cert_file);
+
+        let mut key_file = fs::File::create(&key).expect("Failed to create key file");
+        key_file.write_all(b"dummy key content").expect("Failed to write key");
+        key_file.sync_all().expect("Failed to sync key");
+        drop(key_file);
+
+        // Double check files exist
+        assert!(cert.exists(), "Cert file does not exist after creation");
+        assert!(key.exists(), "Key file does not exist after creation");
+
+        let cred = SAPHdlfsCredential::new(&cert, &key);
+        assert!(cred.validate().is_ok());
+
+        // Cleanup
+        let _ = fs::remove_file(&cert);
+        let _ = fs::remove_file(&key);
+    }
+
+    #[test]
+    fn test_error_conversion() {
+        let cert = PathBuf::from("missing_cert.pem");
+        let err = Error::CertificateNotFound(cert.clone());
+        let crate_err: crate::Error = err.into();
+        match crate_err {
+            crate::Error::Generic { store, source } => {
+                assert_eq!(store, crate::hdlfs::STORE);
+                assert!(format!("{:?}", source).contains("CertificateNotFound"));
+            }
+            _ => panic!("Expected Generic error"),
+        }
+    }
+}

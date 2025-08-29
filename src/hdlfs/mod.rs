@@ -307,3 +307,191 @@ impl MultipartStore for crate::hdlfs::SAPHdlfs {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{GetRange, PutPayload};
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    // Helper function to create a mock client for testing
+    fn create_mock_sap_hdlfs(trace: bool) -> SAPHdlfs {
+        use crate::hdlfs::client::{SAPHdlfsClient, SAPHdlfsConfig};
+        use crate::client::HttpClient;
+        use std::time::Duration;
+        use crate::{ClientOptions, RetryConfig};
+        use url::Url;
+
+        let http_client = HttpClient::new(reqwest::Client::new());
+        let retry_config = RetryConfig::default();
+        let client_options = ClientOptions::new().with_timeout(Duration::from_secs(60));
+
+        let service_url = Url::parse("https://test-container.files.hdl.test.hanacloud.ondemand.com").unwrap();
+        let config = SAPHdlfsConfig::new(
+            "test-container".to_string(),
+            service_url,
+            false, // is_emulator
+            trace,
+            retry_config,
+            client_options,
+        );
+
+        let mock_client = SAPHdlfsClient::new(config, http_client);
+
+        SAPHdlfs {
+            client: Arc::new(mock_client),
+        }
+    }
+
+    #[test]
+    fn test_basic_functionality() {
+        // Test tracing
+        let client_no_trace = create_mock_sap_hdlfs(false);
+        assert!(!client_no_trace.need_trace());
+
+        let client_with_trace = create_mock_sap_hdlfs(true);
+        assert!(client_with_trace.need_trace());
+
+        // Test display
+        let display_str = format!("{}", client_no_trace);
+        assert_eq!(display_str, "SAPHdlfs { ... }");
+
+        // Test trace macro
+        trace_api_call!(client_no_trace, "Test message: {}", "value");
+        trace_api_call!(client_with_trace, "Test message: {}", "value");
+
+        // Test constants
+        assert_eq!(STORE, "HDLFS");
+    }
+
+    #[tokio::test]
+    async fn test_object_store_methods() {
+        let client = create_mock_sap_hdlfs(false);
+        let path = Path::from("test/file.txt");
+        let payload = PutPayload::from_bytes(Bytes::from("test content"));
+
+        // Test put_opts
+        let result = client.put_opts(&path, payload, PutOptions::default()).await;
+        assert!(result.is_err()); // Expected to fail with mock client
+
+        // Test put_multipart_opts
+        let result = client.put_multipart_opts(&path, PutMultipartOptions::default()).await;
+        assert!(result.is_ok());
+
+        // Test get_opts with different ranges
+        for range in [
+            None,
+            Some(GetRange::Bounded(0..10)),
+            Some(GetRange::Offset(5)),
+            Some(GetRange::Suffix(10)),
+        ] {
+            let opts = GetOptions { range, ..Default::default() };
+            let result = client.get_opts(&path, opts).await;
+            assert!(result.is_err()); // Expected to fail with mock client
+        }
+
+        // Test delete
+        let result = client.delete(&path).await;
+        assert!(result.is_err()); // Expected to fail with mock client
+
+        // Test list (stream creation should succeed)
+        let _stream_with_prefix = client.list(Some(&Path::from("test/")));
+        let _stream_no_prefix = client.list(None);
+
+        // Test list_with_delimiter
+        for prefix in [Some(&Path::from("test/")), None] {
+            let result = client.list_with_delimiter(prefix).await;
+            assert!(result.is_err()); // Expected to fail with mock client
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "not implemented")]
+    async fn test_copy_methods() {
+        let client = create_mock_sap_hdlfs(false);
+        let from = Path::from("test/source.txt");
+        let to = Path::from("test/dest.txt");
+
+        // Test copy (should panic with "not implemented")
+        let _result = client.copy(&from, &to).await;
+    }
+
+    #[tokio::test]
+    async fn test_multipart_operations() {
+        let client = create_mock_sap_hdlfs(false);
+        let path = Path::from("test/file.txt");
+        let opts = PutMultipartOptions::default();
+
+        // Test MultipartUpload trait
+        let mut multipart_upload = client.put_multipart_opts(&path, opts).await.unwrap();
+
+        // Test multiple parts with part index increment
+        for i in 0..3 {
+            let payload = PutPayload::from_bytes(Bytes::from(format!("part{}", i)));
+            let upload_part = multipart_upload.put_part(payload);
+            let result = upload_part.await;
+            assert!(result.is_err()); // Expected to fail with mock client
+        }
+
+        // Test complete
+        let result = multipart_upload.complete().await;
+        assert!(result.is_err()); // Expected to fail with mock client
+
+        // Test abort (new upload instance)
+        let mut multipart_upload2 = client.put_multipart_opts(&path, PutMultipartOptions::default()).await.unwrap();
+        let result = multipart_upload2.abort().await;
+        assert!(result.is_ok()); // abort always succeeds
+
+        // Test MultipartStore trait
+        let result = client.create_multipart(&path).await;
+        assert!(result.is_ok() && result.unwrap().is_empty());
+
+        let multipart_id = String::new();
+        let payload = PutPayload::from_bytes(Bytes::from("test content"));
+        let result = client.put_part(&path, &multipart_id, 0, payload).await;
+        assert!(result.is_err()); // Expected to fail with mock client
+
+        let parts = vec![
+            PartId { content_id: "part1".to_string() },
+            PartId { content_id: "part2".to_string() }
+        ];
+        let result = client.complete_multipart(&path, &multipart_id, parts).await;
+        assert!(result.is_err()); // Expected to fail with mock client
+
+        let result = client.abort_multipart(&path, &multipart_id).await;
+        assert!(result.is_ok()); // abort always succeeds
+    }
+
+    #[test]
+    fn test_debug_implementations() {
+        let client = create_mock_sap_hdlfs(false);
+        let client_arc = client.client.clone();
+
+        // Test SAPHdlfs Debug
+        let debug_str = format!("{:?}", client);
+        assert!(debug_str.contains("SAPHdlfs"));
+
+        // Test UploadState Debug
+        let upload_state = UploadState {
+            location: Path::from("test/file.txt"),
+            parts: Default::default(),
+            client: client_arc.clone(),
+        };
+        let debug_str = format!("{:?}", upload_state);
+        assert!(debug_str.contains("UploadState"));
+
+        // Test SAPHdlfsMultiPartUpload Debug
+        let multipart_upload = SAPHdlfsMultiPartUpload {
+            part_idx: 0,
+            state: Arc::new(UploadState {
+                location: Path::from("test/file.txt"),
+                parts: Default::default(),
+                client: client_arc,
+            }),
+            opts: PutMultipartOptions::default(),
+        };
+        let debug_str = format!("{:?}", multipart_upload);
+        assert!(debug_str.contains("SAPHdlfsMultiPartUpload"));
+    }
+}

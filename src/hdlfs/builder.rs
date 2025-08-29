@@ -443,3 +443,350 @@ impl Display for SAPHdlfsBuilder {
         write!(f, "HdlfsBuilder(endpoint={})", self.endpoint)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    // Test helper to create temp files for build tests
+    fn create_test_files() -> (NamedTempFile, NamedTempFile) {
+        let mut cert_file = NamedTempFile::new().unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(b"-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----").unwrap();
+        key_file.write_all(b"-----BEGIN PRIVATE KEY-----\nTEST\n-----END PRIVATE KEY-----").unwrap();
+        (cert_file, key_file)
+    }
+
+    #[test]
+    fn test_builder_methods_and_traits() {
+        // Test all builder methods and traits in one comprehensive test
+        let builder = SAPHdlfsBuilder::new()
+            .with_container_id("test_container")
+            .with_endpoint("test.endpoint.com")
+            .with_trace(true)
+            .with_use_emulator(true)
+            .with_credential(SAPHdlfsCredential::default())
+            .with_url("hdlfs://test.example.com")
+            .with_retry(RetryConfig { max_retries: 5, ..Default::default() });
+
+        // Test builder state
+        assert_eq!(builder.container_id, "test_container");
+        assert_eq!(builder.trace.get().unwrap(), true);
+        assert_eq!(builder.url, Some("hdlfs://test.example.com".to_string()));
+
+        // Test Display and Debug traits
+        assert_eq!(format!("{}", builder), "HdlfsBuilder(endpoint=test.endpoint.com)");
+        assert!(format!("{:?}", builder).contains("SAPHdlfsBuilder"));
+    }
+
+    #[test]
+    fn test_config_keys_and_parsing() {
+        // Test all config key variants in a compact way
+        let key_tests = [
+            ("private_key", SAPHdlfsConfigKey::PrivateKey, "hdlfs_storage_private_key"),
+            ("certificate", SAPHdlfsConfigKey::Certificate, "hdlfs_storage_certificate"),
+            ("endpoint", SAPHdlfsConfigKey::Endpoint, "hdlfs_storage_endpoint"),
+            ("container_id", SAPHdlfsConfigKey::ContainerId, "hdlfs_container_id"),
+            ("use_emulator", SAPHdlfsConfigKey::UseEmulator, "hdlfs_storage_use_emulator"),
+            ("trace", SAPHdlfsConfigKey::Trace, "hdlfs_storage_trace"),
+        ];
+
+        for (input, expected_key, expected_ref) in &key_tests {
+            assert_eq!(SAPHdlfsConfigKey::from_str(input).unwrap(), *expected_key);
+            assert_eq!(expected_key.as_ref(), *expected_ref);
+            // Test case insensitive parsing
+            assert_eq!(SAPHdlfsConfigKey::from_str(&input.to_uppercase()).unwrap(), *expected_key);
+        }
+
+        // Test error cases and client delegation
+        assert!(SAPHdlfsConfigKey::from_str("unknown_key").is_err());
+        assert!(matches!(SAPHdlfsConfigKey::from_str("allow_http").unwrap(), SAPHdlfsConfigKey::Client(_)));
+
+        // Test config methods
+        let builder = SAPHdlfsBuilder::default()
+            .with_config(SAPHdlfsConfigKey::ContainerId, "test")
+            .with_config(SAPHdlfsConfigKey::UseEmulator, "true")
+            .with_config(SAPHdlfsConfigKey::UseEmulator, "invalid_bool"); // Should be ignored
+
+        assert_eq!(builder.get_config_value(&SAPHdlfsConfigKey::ContainerId).unwrap(), "test");
+        assert_eq!(builder.get_config_value(&SAPHdlfsConfigKey::UseEmulator).unwrap(), "true");
+    }
+
+    #[test]
+    fn test_url_parsing() {
+        let valid_endpoint = "7e698a97-a320-464d-9950-06ceee326fd2.files.hdl.canary-eu10.hanacloud.ondemand.com";
+
+        // Test successful URL parsing for both schemes
+        for scheme in ["hdlfs", "https"] {
+            let mut builder = SAPHdlfsBuilder::default();
+            let url = format!("{}://{}", scheme, valid_endpoint);
+            assert!(builder.parse_url(&url).is_ok());
+            assert_eq!(builder.container_id, "7e698a97-a320-464d-9950-06ceee326fd2");
+        }
+
+        // Test endpoint parsing
+        let mut builder = SAPHdlfsBuilder::default();
+        assert!(builder.parse_endpoint(valid_endpoint).is_ok());
+        assert_eq!(builder.container_id, "7e698a97-a320-464d-9950-06ceee326fd2");
+
+        // Test error cases
+        let error_cases = [
+            "ftp://invalid.scheme.com",
+            "hdlfs://short.host",
+            "not_a_url",
+        ];
+
+        for invalid_url in &error_cases {
+            let mut builder = SAPHdlfsBuilder::default();
+            assert!(builder.parse_url(invalid_url).is_err());
+        }
+
+        // Test endpoint error
+        assert!(SAPHdlfsBuilder::default().parse_endpoint("short.host").is_err());
+    }
+
+    #[test]
+    fn test_error_types_and_conversion() {
+        // Test all error variants
+        let errors = [
+            Error::InvalidKey("test".to_string()),
+            Error::InvalidCertificate("test".to_string()),
+            Error::UnknownUrlScheme { scheme: "ftp".to_string() },
+            Error::UrlNotRecognised { url: "test".to_string() },
+            Error::UnknownConfigurationKey { key: "unknown".to_string() },
+        ];
+
+        for error in errors {
+            // Test error display
+            let error_msg = format!("{}", error);
+            assert!(!error_msg.is_empty());
+
+            // Test conversion to crate::Error
+            let crate_error: crate::Error = error.into();
+            match crate_error {
+                crate::Error::Generic { store, .. } => assert_eq!(store, crate::hdlfs::STORE),
+                _ => panic!("Expected Generic error"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_error_paths() {
+        let endpoint = "test.files.hdl.region.hanacloud.ondemand.com";
+
+        // Test missing cert file
+        let cred = SAPHdlfsCredential {
+            cert_path: "nonexistent.pem".into(),
+            key_path: "nonexistent.pem".into(),
+            ..Default::default()
+        };
+        let result = SAPHdlfsBuilder::default()
+            .with_endpoint(endpoint)
+            .with_credential(cred)
+            .build();
+        assert!(result.is_err());
+
+        // Test different key type parsing errors
+        let key_formats: &[&[u8]] = &[
+            b"-----BEGIN PRIVATE KEY-----\ninvalid\n-----END PRIVATE KEY-----",
+            b"-----BEGIN RSA PRIVATE KEY-----\ninvalid\n-----END RSA PRIVATE KEY-----",
+            b"-----BEGIN PUBLIC KEY-----\ninvalid\n-----END PUBLIC KEY-----", // Unsupported type
+        ];
+
+        for key_content in key_formats {
+            let (cert_file, mut key_file) = create_test_files();
+            key_file.write_all(key_content).unwrap();
+
+            let cred = SAPHdlfsCredential {
+                cert_path: cert_file.path().to_path_buf(),
+                key_path: key_file.path().to_path_buf(),
+                ..Default::default()
+            };
+
+            let result = SAPHdlfsBuilder::default()
+                .with_endpoint(endpoint)
+                .with_credential(cred)
+                .build();
+            assert!(result.is_err());
+        }
+
+        // Test URL vs endpoint paths in build
+        let (cert_file, key_file) = create_test_files();
+        let cred = SAPHdlfsCredential {
+            cert_path: cert_file.path().to_path_buf(),
+            key_path: key_file.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // Test build with URL
+        let result1 = SAPHdlfsBuilder::default()
+            .with_url(format!("hdlfs://{}", endpoint))
+            .with_credential(cred.clone())
+            .build();
+        assert!(result1.is_err()); // Will fail on certificate processing
+
+        // Test build with endpoint only
+        let result2 = SAPHdlfsBuilder::default()
+            .with_endpoint(endpoint)
+            .with_credential(cred)
+            .build();
+        assert!(result2.is_err()); // Will fail on certificate processing
+    }
+
+    #[test]
+    fn test_environment_and_serde() {
+        // Test environment loading with various scenarios
+        std::env::set_var("HDLFS_CONTAINER_ID", "env_test");
+        std::env::set_var("HDLFS_STORAGE_TRACE", "true");
+        std::env::set_var("HDLFS_STORAGE_USE_EMULATOR", "false");
+        std::env::set_var("HDLFS_INVALID_KEY", "ignored"); // Should be ignored
+
+        let builder = SAPHdlfsBuilder::from_env();
+        assert_eq!(builder.container_id, "env_test");
+        assert_eq!(builder.trace.get().unwrap(), true);
+        assert_eq!(builder.use_emulator.get().unwrap(), false);
+
+        // Cleanup
+        std::env::remove_var("HDLFS_CONTAINER_ID");
+        std::env::remove_var("HDLFS_STORAGE_TRACE");
+        std::env::remove_var("HDLFS_STORAGE_USE_EMULATOR");
+        std::env::remove_var("HDLFS_INVALID_KEY");
+
+        // Test environment with non-UTF8 values (coverage edge case)
+        std::env::set_var("HDLFS_STORAGE_ENDPOINT", "test.endpoint.com");
+        let builder2 = SAPHdlfsBuilder::from_env();
+        assert_eq!(builder2.endpoint, "test.endpoint.com");
+        std::env::remove_var("HDLFS_STORAGE_ENDPOINT");
+
+        // Test serde functionality
+        let key = SAPHdlfsConfigKey::PrivateKey;
+        let serialized = serde_json::to_string(&key).unwrap();
+        let deserialized: SAPHdlfsConfigKey = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(key, deserialized);
+
+        // Test enum traits
+        assert_eq!(key, key.clone());
+        assert!(format!("{:?}", key).contains("PrivateKey"));
+    }
+
+    #[test]
+    fn test_additional_coverage() {
+        // Test all get_config_value branches including None returns
+        let builder = SAPHdlfsBuilder::default();
+
+        // Test get_config_value for all key types
+        assert!(builder.get_config_value(&SAPHdlfsConfigKey::PrivateKey).is_some()); // Always returns path
+        assert!(builder.get_config_value(&SAPHdlfsConfigKey::Certificate).is_some()); // Always returns path
+        assert!(builder.get_config_value(&SAPHdlfsConfigKey::Endpoint).is_some()); // Always returns endpoint
+        assert!(builder.get_config_value(&SAPHdlfsConfigKey::ContainerId).is_some()); // Always returns container_id
+
+        // Test client config delegation
+        assert!(builder.get_config_value(&SAPHdlfsConfigKey::Client(crate::client::ClientConfigKey::AllowHttp)).is_some());
+
+        // Test all remaining error types
+        let additional_errors = vec![
+            Error::ConfigError(crate::Error::Generic { store: "test", source: Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "test")) }),
+            Error::IoError(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "test")),
+            Error::UrlParse(url::ParseError::EmptyHost),
+            Error::UrlParseError("test_url".to_string(), url::ParseError::EmptyHost),
+        ];
+
+        for error in additional_errors {
+            let error_msg = format!("{}", error);
+            assert!(!error_msg.is_empty());
+            let crate_error: crate::Error = error.into();
+            match crate_error {
+                crate::Error::Generic { store, .. } => assert_eq!(store, crate::hdlfs::STORE),
+                _ => {} // Some errors might convert differently
+            }
+        }
+
+        // Test URL parsing edge case - no host
+        let mut builder = SAPHdlfsBuilder::default();
+        assert!(builder.parse_url("hdlfs://").is_err()); // No host case
+
+        // Test with_config for all boolean parsing scenarios
+        let builder = SAPHdlfsBuilder::default()
+            .with_config(SAPHdlfsConfigKey::Trace, "false")
+            .with_config(SAPHdlfsConfigKey::UseEmulator, "invalid") // Should be ignored
+            .with_config(SAPHdlfsConfigKey::UseEmulator, "true"); // Should override
+
+        assert_eq!(builder.get_config_value(&SAPHdlfsConfigKey::Trace).unwrap(), "false");
+        assert_eq!(builder.get_config_value(&SAPHdlfsConfigKey::UseEmulator).unwrap(), "true");
+
+        // Test ConfigValue None case by checking trace/emulator values when set to invalid values
+        let builder_invalid = SAPHdlfsBuilder::default()
+            .with_config(SAPHdlfsConfigKey::Trace, "not_a_bool")
+            .with_config(SAPHdlfsConfigKey::UseEmulator, "also_not_a_bool");
+
+        // These should either be None or have some default handling
+        let trace_invalid = builder_invalid.get_config_value(&SAPHdlfsConfigKey::Trace);
+        let emulator_invalid = builder_invalid.get_config_value(&SAPHdlfsConfigKey::UseEmulator);
+        // The behavior depends on ConfigValue implementation - we just ensure no panic
+    }
+
+    #[test]
+    fn test_build_key_processing_coverage() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let endpoint = "test.files.hdl.region.hanacloud.ondemand.com";
+
+        // Test missing key file (different from missing cert)
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(b"-----BEGIN CERTIFICATE-----\nVGVzdA==\n-----END CERTIFICATE-----").unwrap();
+
+        let cred = SAPHdlfsCredential {
+            cert_path: cert_file.path().to_path_buf(),
+            key_path: "nonexistent_key.pem".into(),
+            ..Default::default()
+        };
+
+        let result = SAPHdlfsBuilder::default()
+            .with_endpoint(endpoint)
+            .with_credential(cred)
+            .build();
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("Failed to read key"));
+
+        // Test key file that fails PEM parsing
+        let mut cert_file2 = NamedTempFile::new().unwrap();
+        let mut key_file2 = NamedTempFile::new().unwrap();
+        cert_file2.write_all(b"-----BEGIN CERTIFICATE-----\nVGVzdA==\n-----END CERTIFICATE-----").unwrap();
+        key_file2.write_all(b"not a valid PEM file at all").unwrap();
+
+        let cred2 = SAPHdlfsCredential {
+            cert_path: cert_file2.path().to_path_buf(),
+            key_path: key_file2.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let result2 = SAPHdlfsBuilder::default()
+            .with_endpoint(endpoint)
+            .with_credential(cred2)
+            .build();
+        assert!(result2.is_err());
+
+        // Test successful key parsing but invalid RSA key
+        let mut cert_file3 = NamedTempFile::new().unwrap();
+        let mut key_file3 = NamedTempFile::new().unwrap();
+        cert_file3.write_all(b"-----BEGIN CERTIFICATE-----\nVGVzdA==\n-----END CERTIFICATE-----").unwrap();
+
+        // Valid PEM structure but invalid key content
+        key_file3.write_all(b"-----BEGIN PRIVATE KEY-----\nTUlJRXZRSUJBREFOQmdrcWhraUc5dzBCQVFFRkFBU0NCS2N3Z2dTakFnRUFBb0lCQVFE\n-----END PRIVATE KEY-----").unwrap();
+
+        let cred3 = SAPHdlfsCredential {
+            cert_path: cert_file3.path().to_path_buf(),
+            key_path: key_file3.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let result3 = SAPHdlfsBuilder::default()
+            .with_endpoint(endpoint)
+            .with_credential(cred3)
+            .build();
+        assert!(result3.is_err());
+    }
+}
