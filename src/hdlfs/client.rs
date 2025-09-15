@@ -245,7 +245,8 @@ impl SAPHdlfsClient {
     }
 
     pub(crate) fn object_url(&self, path: &Path) -> String {
-        self.config.service.join(path.as_ref()).unwrap().to_string()
+        let double_encoded_path = path.as_ref().replace('%', "%25");
+        self.config.service.join(double_encoded_path).unwrap().to_string()
     }
 
     pub(crate) fn need_trace(&self) -> bool {
