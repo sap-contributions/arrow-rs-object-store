@@ -246,7 +246,7 @@ impl SAPHdlfsClient {
 
     pub(crate) fn object_url(&self, path: &Path) -> String {
         let double_encoded_path = path.as_ref().replace('%', "%25");
-        self.config.service.join(double_encoded_path).unwrap().to_string()
+        self.config.service.join(&double_encoded_path).unwrap().to_string()
     }
 
     pub(crate) fn need_trace(&self) -> bool {
@@ -719,9 +719,8 @@ impl ListClient for Arc<SAPHdlfsClient> {
 
             trace_log!(
                 self,
-                "list_request loop_count:{}, page_id: {:?}",
+                "list_request loop_count:{}",
                 loop_count,
-                dir_listing.directory_listing.page_id
             );
 
             // Extract the file status array from the nested structure
