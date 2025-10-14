@@ -19,6 +19,7 @@
 
 use crate::client::get::GetClientExt;
 use crate::client::list::ListClientExt;
+use crate::client::parts::Parts;
 use crate::hdlfs::client::SAPHdlfsClient;
 use crate::multipart::{MultipartStore, PartId};
 use crate::{
@@ -205,7 +206,7 @@ struct SAPHdlfsMultiPartUpload {
 #[derive(Debug)]
 struct UploadState {
     location: Path,
-    parts: crate::client::parts::Parts,
+    parts: Parts,
     client: Arc<crate::hdlfs::client::SAPHdlfsClient>,
 }
 
