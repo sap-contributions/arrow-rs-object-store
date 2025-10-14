@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A shared HTTP client implementation incorporating retries
+//! [`RetryConfig`] connection retry policy
 
 use crate::client::backoff::{Backoff, BackoffConfig};
 use crate::client::builder::HttpRequestBuilder;
@@ -421,7 +421,8 @@ impl RetryableRequest {
 
                         let sleep = ctx.backoff();
                         info!(
-                            "Encountered server error, backing off for {} seconds, retry {} of {}",
+                            "Encountered server error with status {}, backing off for {} seconds, retry {} of {}",
+                            status,
                             sleep.as_secs_f32(),
                             ctx.retries,
                             ctx.max_retries,
@@ -445,7 +446,8 @@ impl RetryableRequest {
                     }
                     let sleep = ctx.backoff();
                     info!(
-                        "Encountered transport error backing off for {} seconds, retry {} of {}: {}",
+                        "Encountered transport error of kind {:?}, backing off for {} seconds, retry {} of {}: {}",
+                        e.kind(),
                         sleep.as_secs_f32(),
                         ctx.retries,
                         ctx.max_retries,
