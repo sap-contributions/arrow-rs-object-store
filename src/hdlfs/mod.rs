@@ -41,6 +41,9 @@ mod client;
 mod credential;
 
 mod list;
+
+mod filestatus;
+
 const STORE: &str = "HDLFS";
 
 macro_rules! trace_api_call {

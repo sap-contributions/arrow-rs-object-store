@@ -42,6 +42,7 @@ use crate::hdlfs::list::{
     BatchDeleteWrapper, DeleteFile, DirectoryListing, MergeSource, MergeSourcesWrapper,
     NonRecursiveDirectoryListing,
 };
+use crate::hdlfs::filestatus::FileStatusResponse;
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
 use crate::GetOptions;
@@ -62,7 +63,6 @@ const HDLFS_FILE_CONTAINER: &str = "X-SAP-FileContainer";
 const HDLFS_CONTENT_TYPE: &str = "Content-Type";
 const HDLFS_BINARY: &str = "application/octet-stream";
 const HDLFS_JSON: &str = "application/json";
-const MAX_OFFSET: &i64 = &(1024 * 1024 * 1024 * 16); // 16 GB
 
 const LIST_DLT_SUFFIX1: &str = "__list_delta_table_1__/";
 const LIST_DLT_SUFFIX2: &str = "__list_delta_table_2__/";
@@ -269,6 +269,39 @@ impl SAPHdlfsClient {
             idempotent: false,
         }
     }
+
+    pub(crate) async fn get_file_length(&self, path: &Path) -> crate::Result<u64> {
+        let builder = self
+            .request(Method::GET, path)
+            .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
+            .query(&[("op", "GETFILESTATUS")]);
+
+        let resp = match builder.send().await {
+            Ok(r) => r,
+            Err(source) => {
+                if source.status() == Some(StatusCode::NOT_FOUND) {
+                    return Err(crate::Error::NotFound {
+                        path: path.as_ref().to_string(),
+                        source: Box::new(source),
+                    });
+                }
+                let path_str = path.as_ref().to_string();
+                return Err(Error::GetRequest { source, path: path_str }.into());
+            }
+        };
+
+        let body = resp
+            .into_body()
+            .bytes()
+            .await
+            .map_err(|e| Error::Http { source: Box::new(e) })?;
+
+        let meta: FileStatusResponse =
+            serde_json::from_slice(&body).map_err(|source| Error::InvalidListResponseJson { source })?;
+
+        Ok(meta.file_status.length)
+    }
+
     pub(crate) async fn put_blob(
         &self,
         location: &crate::path::Path,
@@ -566,34 +599,38 @@ impl GetClient for SAPHdlfsClient {
 
         let mut parameters = vec![("op".to_owned(), "OPEN".to_owned())];
 
+        // Rust range syntax start..end is half‑open: it includes start and excludes end ([start, end)).
+        // HTTP Content-Range uses inclusive bounds: bytes start-end/total
+        // start = zero-based index of the first byte returned
+        // end = zero-based index of the last byte returned (inclusive)
+        // total = full size of the resource in bytes (or * if the total length is unknown)
+
         let mut content_range = String::new();
-        let mut is_range_supported = false;
         if let Some(range) = &options.range {
+            let file_len = self.get_file_length(path).await?;
+
             match range {
                 GetRange::Bounded(r) => {
                     let offset = r.start.to_string();
                     let length = (r.end - r.start).to_string();
-                    content_range = format!("bytes {}-{}/{}", r.start, r.end - 1, MAX_OFFSET);
+                    content_range = format!("bytes {}-{}/{}", r.start, r.end - 1, file_len);
                     parameters.push(("offset".to_owned(), offset));
                     parameters.push(("length".to_owned(), length));
-                    is_range_supported = true;
                 }
                 GetRange::Offset(o) => {
                     let offset = o.to_string();
-                    content_range = format!("bytes {}-/*", offset);
+                    content_range = format!("bytes {}-/{}", offset, file_len);
                     parameters.push(("offset".to_owned(), offset));
-                    is_range_supported = true;
                 }
                 GetRange::Suffix(l) => {
-                    //let length = l.to_string();
-                    //content_range = format!("bytes -{}/*", length);
-                    //parameters.push(("length".to_owned(), length));
-                    trace_log!(
-                        self,
-                        "suffix range last:{} bytes not supported; falling back to full file path:{}",
-                        l,
-                        path.as_ref()
-                    );
+                    let start = file_len.saturating_sub(*l);
+                    let end = file_len; // exclusive
+
+                    let offset = start.to_string();
+                    let length = l.to_string();
+                    content_range = format!("bytes {}-{}/{}", start, end - 1, file_len);
+                    parameters.push(("offset".to_owned(), offset));
+                    parameters.push(("length".to_owned(), length));
                 }
             }
         }
@@ -609,7 +646,7 @@ impl GetClient for SAPHdlfsClient {
 
         match response {
             Ok(resp) => {
-                if is_range_supported {
+                if options.range.is_some()  {
                     let (mut parts, body) = self.handle_chunked_response(resp, path).await?;
                     parts
                         .headers
