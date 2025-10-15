@@ -246,7 +246,11 @@ impl SAPHdlfsClient {
 
     pub(crate) fn object_url(&self, path: &Path) -> String {
         let double_encoded_path = path.as_ref().replace('%', "%25");
-        self.config.service.join(&double_encoded_path).unwrap().to_string()
+        self.config
+            .service
+            .join(&double_encoded_path)
+            .unwrap()
+            .to_string()
     }
 
     pub(crate) fn need_trace(&self) -> bool {
@@ -454,7 +458,11 @@ impl SAPHdlfsClient {
         }
     }
 
-    async fn list_delta_table(&self, path: &str, recursion_depth: usize) -> crate::Result<Vec<Path>> {
+    async fn list_delta_table(
+        &self,
+        path: &str,
+        recursion_depth: usize,
+    ) -> crate::Result<Vec<Path>> {
         let mut tab_list = Vec::new();
         let mut stack = vec![path.to_string()];
 
@@ -504,22 +512,18 @@ impl SAPHdlfsClient {
             // Extract the file status array from the nested structure
             dir_listing.file_statuses.file_status.iter().for_each(|f| {
                 if f.file_type == "DIRECTORY" {
-                    let child_path = f
-                        .path_suffix
-                        .strip_suffix('/')
-                        .unwrap_or(&f.path_suffix);
-                    let parent_path = current_path
-                        .strip_suffix('/')
-                        .unwrap_or(&current_path);
+                    let child_path = f.path_suffix.strip_suffix('/').unwrap_or(&f.path_suffix);
+                    let parent_path = current_path.strip_suffix('/').unwrap_or(&current_path);
 
                     if child_path == "_error_table_" {
                         return; // Skip "_error_table_" directories
                     }
-                    if child_path == "_table_"  {
+                    if child_path == "_table_" {
                         let table_path = Path::from(format!("{}/{}/", parent_path, child_path));
                         tab_list.push(table_path);
                     } else {
-                        let table_path = Path::from(format!("{}/{}/_table_/", parent_path, child_path));
+                        let table_path =
+                            Path::from(format!("{}/{}/_table_/", parent_path, child_path));
                         let next_path = format!("{}/{}/", parent_path, child_path).to_string();
 
                         if nth_last_node.len() <= 3 && nth_last_node.starts_with("v") {
@@ -563,6 +567,7 @@ impl GetClient for SAPHdlfsClient {
         let mut parameters = vec![("op".to_owned(), "OPEN".to_owned())];
 
         let mut content_range = String::new();
+        let mut is_range_supported = false;
         if let Some(range) = &options.range {
             match range {
                 GetRange::Bounded(r) => {
@@ -571,16 +576,24 @@ impl GetClient for SAPHdlfsClient {
                     content_range = format!("bytes {}-{}/{}", r.start, r.end - 1, MAX_OFFSET);
                     parameters.push(("offset".to_owned(), offset));
                     parameters.push(("length".to_owned(), length));
+                    is_range_supported = true;
                 }
                 GetRange::Offset(o) => {
                     let offset = o.to_string();
                     content_range = format!("bytes {}-/*", offset);
                     parameters.push(("offset".to_owned(), offset));
+                    is_range_supported = true;
                 }
                 GetRange::Suffix(l) => {
-                    let length = l.to_string();
-                    content_range = format!("bytes -{}/*", length);
-                    parameters.push(("length".to_owned(), length));
+                    //let length = l.to_string();
+                    //content_range = format!("bytes -{}/*", length);
+                    //parameters.push(("length".to_owned(), length));
+                    trace_log!(
+                        self,
+                        "suffix range last:{} bytes not supported; falling back to full file path:{}",
+                        l,
+                        path.as_ref()
+                    );
                 }
             }
         }
@@ -717,11 +730,7 @@ impl ListClient for Arc<SAPHdlfsClient> {
             let dir_listing: DirectoryListing = serde_json::from_slice(&body_bytes)
                 .map_err(|source| Error::InvalidListResponseJson { source })?;
 
-            trace_log!(
-                self,
-                "list_request loop_count:{}",
-                loop_count,
-            );
+            trace_log!(self, "list_request loop_count:{}", loop_count,);
 
             // Extract the file status array from the nested structure
             let files = dir_listing
