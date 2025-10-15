@@ -609,7 +609,7 @@ impl GetClient for SAPHdlfsClient {
 
         match response {
             Ok(resp) => {
-                if options.range.is_some() {
+                if is_range_supported {
                     let (mut parts, body) = self.handle_chunked_response(resp, path).await?;
                     parts
                         .headers
