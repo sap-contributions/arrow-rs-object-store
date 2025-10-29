@@ -329,10 +329,12 @@ impl SAPHdlfsBuilder {
 
         match parsed.scheme() {
             "hdlfs" | "https" => {
-                // Example: 7e698a97-a320-464d-9950-06ceee326fd2.files.hdl.canary-eu10.hanacloud.ondemand.com
+                // Example:
+                //   7e698a97-a320-464d-9950-06ceee326fd2.files.hdl.canary-eu10.hanacloud.ondemand.com
+                //   75d66c40-c108-4474-8c59-1f8a62784b7c.files.hdl.azure.hc-br20.hanacloud.ondemand.com
                 eprintln!("host: {}", host);
                 let parts: Vec<&str> = host.split('.').collect();
-                if parts.len() != 7 {
+                if parts.len() != 7 && parts.len() != 8 {
                     return Err(
                         Error::UrlParseError(url.to_string(), url::ParseError::EmptyHost).into(),
                     );
