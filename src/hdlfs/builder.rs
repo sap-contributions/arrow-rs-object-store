@@ -277,7 +277,7 @@ impl SAPHdlfsBuilder {
         self.trace = trace.into();
         self
     }
-    
+
     /// Set the retry configuration
     pub fn with_retry(mut self, retry_config: RetryConfig) -> Self {
         self.retry_config = retry_config;

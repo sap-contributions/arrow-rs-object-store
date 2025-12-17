@@ -58,7 +58,7 @@ macro_rules! trace_api_call {
 /// Client for SAP HANA Cloud, Data Lake Files operations
 #[derive(Debug)]
 pub struct SAPHdlfs {
-    client: Arc<SAPHdlfsClient>,
+    pub client: Arc<SAPHdlfsClient>,
 }
 
 impl SAPHdlfs {

@@ -516,11 +516,11 @@ pub mod chunked;
 pub mod delimited;
 #[cfg(feature = "gcp")]
 pub mod gcp;
-#[cfg(feature = "http")]
-pub mod http;
 #[cfg(feature = "hdlfs")]
 pub mod hdlfs;
 pub mod limit;
+#[cfg(feature = "http")]
+pub mod http;
 #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 pub mod local;
 pub mod memory;

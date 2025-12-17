@@ -38,11 +38,10 @@ use std::sync::Arc;
 
 use crate::client::get::GetClient;
 use crate::client::list::ListClient;
-use crate::hdlfs::list::{
-    BatchDeleteWrapper, DeleteFile, DirectoryListing, MergeSource, MergeSourcesWrapper,
-    NonRecursiveDirectoryListing,
-};
 use crate::hdlfs::filestatus::FileStatusResponse;
+use crate::hdlfs::list::{
+    BatchDeleteWrapper, DeleteFile, MergeSource, MergeSourcesWrapper, NonRecursiveDirectoryListing,
+};
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
 use crate::GetOptions;
@@ -224,7 +223,7 @@ impl Request<'_> {
 
         // HDLFS does not provide version or etag in headers, so return default PutResult
         Ok(PutResult {
-            e_tag: e_tag,
+            e_tag,
             version: None,
         })
     }
@@ -286,18 +285,20 @@ impl SAPHdlfsClient {
                     });
                 }
                 let path_str = path.as_ref().to_string();
-                return Err(Error::GetRequest { source, path: path_str }.into());
+                return Err(Error::GetRequest {
+                    source,
+                    path: path_str,
+                }
+                .into());
             }
         };
 
-        let body = resp
-            .into_body()
-            .bytes()
-            .await
-            .map_err(|e| Error::Http { source: Box::new(e) })?;
+        let body = resp.into_body().bytes().await.map_err(|e| Error::Http {
+            source: Box::new(e),
+        })?;
 
-        let meta: FileStatusResponse =
-            serde_json::from_slice(&body).map_err(|source| Error::InvalidListResponseJson { source })?;
+        let meta: FileStatusResponse = serde_json::from_slice(&body)
+            .map_err(|source| Error::InvalidListResponseJson { source })?;
 
         Ok(meta.file_status.length)
     }
@@ -646,7 +647,7 @@ impl GetClient for SAPHdlfsClient {
 
         match response {
             Ok(resp) => {
-                if options.range.is_some()  {
+                if options.range.is_some() {
                     let (mut parts, body) = self.handle_chunked_response(resp, path).await?;
                     parts
                         .headers
@@ -703,7 +704,7 @@ impl ListClient for Arc<SAPHdlfsClient> {
             let common_prefixes = self.list_delta_table(list_path, recursion_depth).await?;
             return Ok(PaginatedListResult {
                 result: ListResult {
-                    common_prefixes: common_prefixes,
+                    common_prefixes,
                     objects: Vec::new(),
                 },
                 page_token: None,
@@ -712,101 +713,80 @@ impl ListClient for Arc<SAPHdlfsClient> {
 
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
-        let mut start_after: Option<String> = None;
-        let mut loop_count = 0;
+        let start_after: Option<String> = None;
 
-        loop {
-            let mut query = vec![("op", "LISTSTATUS_RECURSIVE")];
-            if let Some(ref sa) = start_after {
-                query.push(("startAfter", sa.as_str()));
-            }
-
-            // Build the request with required headers and query
-            let builder = self
-                .request(Method::GET, &path)
-                .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
-                .query(&query);
-
-            let response = match builder.send().await {
-                Ok(response) => response,
-                Err(source) => {
-                    if source.status() == Some(StatusCode::NOT_FOUND) {
-                        trace_log!(self, "ListClient 404 ");
-
-                        // If the prefix does not exist, return an empty list.
-                        return Ok(PaginatedListResult {
-                            result: ListResult {
-                                common_prefixes: Vec::new(),
-                                objects: Vec::new(),
-                            },
-                            page_token: None,
-                        });
-                    }
-                    return Err(Error::ListRequest { source }.into());
-                }
-            };
-
-            let body_bytes = response
-                .into_body()
-                .bytes()
-                .await
-                .map_err(|e| Error::Http {
-                    source: Box::new(e),
-                })?;
-
-            // Print full response body for debugging
-            let body_str = String::from_utf8_lossy(&body_bytes);
-            trace_log!(
-                self,
-                "list_request , path:{:?} , full body len:{}",
-                prefix,
-                body_str.len()
-            );
-
-            // Parse the nested JSON structure
-            let dir_listing: DirectoryListing = serde_json::from_slice(&body_bytes)
-                .map_err(|source| Error::InvalidListResponseJson { source })?;
-
-            trace_log!(self, "list_request loop_count:{}", loop_count,);
-
-            // Extract the file status array from the nested structure
-            let files = dir_listing
-                .directory_listing
-                .partial_listing
-                .file_statuses
-                .file_status;
-
-            objects.extend(files.iter().filter_map(|f| {
-                if f.file_type == "FILE" {
-                    Some(ObjectMeta {
-                        location: Path::from(format!("{}/{}", path.as_ref(), f.path_suffix)),
-                        last_modified: Utc.timestamp_millis_opt(f.modification_time).single()?,
-                        size: f.length,
-                        e_tag: f.e_tag.clone(),
-                        version: f.version.clone(),
-                    })
-                } else {
-                    None
-                }
-            }));
-
-            common_prefixes.extend(files.iter().filter_map(|f| {
-                if f.file_type == "DIRECTORY" {
-                    Some(Path::from(format!("{}/{}", path.as_ref(), f.path_suffix)))
-                } else {
-                    None
-                }
-            }));
-
-            // Get the next page_id
-            let page_id = dir_listing.directory_listing.page_id.clone();
-            if page_id.is_none() {
-                break;
-            }
-
-            start_after = page_id;
-            loop_count += 1;
+        let mut query = vec![("op", "LISTSTATUS")];
+        if let Some(ref sa) = start_after {
+            query.push(("startAfter", sa.as_str()));
         }
+
+        // Build the request with required headers and query
+        let builder = self
+            .request(Method::GET, &path)
+            .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
+            .query(&query);
+
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(source) => {
+                if source.status() == Some(StatusCode::NOT_FOUND) {
+                    trace_log!(self, "ListClient 404 ");
+
+                    // If the prefix does not exist, return an empty list.
+                    return Ok(PaginatedListResult {
+                        result: ListResult {
+                            common_prefixes: Vec::new(),
+                            objects: Vec::new(),
+                        },
+                        page_token: None,
+                    });
+                }
+                return Err(Error::ListRequest { source }.into());
+            }
+        };
+
+        let body_bytes = response
+            .into_body()
+            .bytes()
+            .await
+            .map_err(|e| Error::Http {
+                source: Box::new(e),
+            })?;
+
+        // Print full response body for debugging
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        trace_log!(
+            self,
+            "list_request , path:{:?} , full body len:{}",
+            prefix,
+            body_str.len()
+        );
+
+        // Parse the nested JSON structure
+        let dir_listing: NonRecursiveDirectoryListing = serde_json::from_slice(&body_bytes)
+            .map_err(|source| Error::InvalidListResponseJson { source })?;
+
+        // Extract the file status array from the nested structure
+        let files = dir_listing.file_statuses.file_status;
+
+        objects.extend(files.iter().filter_map(|f| {
+            if f.file_type == "FILE" {
+                Some(ObjectMeta {
+                    location: Path::from(format!("{}/{}", path.as_ref(), f.path_suffix)),
+                    last_modified: Utc.timestamp_millis_opt(f.modification_time).single()?,
+                    size: f.length,
+                    e_tag: f.e_tag.clone(),
+                    version: None,
+                })
+            } else {
+                common_prefixes.push(Path::from(format!(
+                    "{}/{}/",
+                    path.as_ref(),
+                    f.path_suffix.strip_suffix('/').unwrap_or(&f.path_suffix)
+                )));
+                None
+            }
+        }));
 
         Ok(PaginatedListResult {
             result: ListResult {
