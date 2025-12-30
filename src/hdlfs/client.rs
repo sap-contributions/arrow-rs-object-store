@@ -40,7 +40,7 @@ use crate::client::get::GetClient;
 use crate::client::list::ListClient;
 use crate::hdlfs::filestatus::FileStatusResponse;
 use crate::hdlfs::list::{
-    BatchDeleteWrapper, DeleteFile, MergeSource, MergeSourcesWrapper, NonRecursiveDirectoryListing,
+    BatchDeleteWrapper, DeleteFile, DirectoryListing, MergeSource, MergeSourcesWrapper, NonRecursiveDirectoryListing,
 };
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
@@ -65,6 +65,7 @@ const HDLFS_JSON: &str = "application/json";
 
 const LIST_DLT_SUFFIX1: &str = "__list_delta_table_1__/";
 const LIST_DLT_SUFFIX2: &str = "__list_delta_table_2__/";
+const LIST_FILES_SUFFIX3: &str = "__list_files_recursive__/";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -571,6 +572,87 @@ impl SAPHdlfsClient {
         }
         Ok(tab_list)
     }
+
+    async fn list_files_recursive(&self, path: &str) -> crate::Result<Vec<ObjectMeta>> {
+        let mut objects = Vec::new();
+        let mut start_after: Option<String> = None;
+        let path_obj = Path::from(path);
+
+        loop {
+            let mut query = vec![("op", "LISTSTATUS_RECURSIVE")];
+            if let Some(ref sa) = start_after {
+                query.push(("startAfter", sa.as_str()));
+            }
+
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            trace_log!(
+                self,
+                "list_files_recursive, time:{} path: {} start_after: {:?}",
+                now,
+                path,
+                start_after
+            );
+
+            // Build the request with required headers and query
+            let builder = self
+                .request(Method::GET, &path_obj)
+                .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
+                .query(&query);
+
+            let response = match builder.send().await {
+                Ok(response) => response,
+                Err(source) => {
+                    if source.status() == Some(StatusCode::NOT_FOUND) {
+                        trace_log!(self, "list_files_recursive 404, path: {}", path);
+                        break;
+                    }
+                    return Err(Error::ListRequest { source }.into());
+                }
+            };
+
+            let body_bytes = response
+                .into_body()
+                .bytes()
+                .await
+                .map_err(|e| Error::Http {
+                    source: Box::new(e),
+                })?;
+
+            let dir_listing: DirectoryListing = serde_json::from_slice(&body_bytes)
+                .map_err(|source| Error::InvalidListResponseJson { source })?;
+
+            // Extract files from the response
+            let files = dir_listing
+                .directory_listing
+                .partial_listing
+                .file_statuses
+                .file_status;
+
+            objects.extend(files.iter().filter_map(|f| {
+                if f.file_type == "FILE" {
+                    Some(ObjectMeta {
+                        location: Path::from(format!("{}/{}", path, f.path_suffix)),
+                        last_modified: Utc.timestamp_millis_opt(f.modification_time).single()?,
+                        size: f.length,
+                        e_tag: f.e_tag.clone(),
+                        version: f.version.clone(),
+                    })
+                } else {
+                    None
+                }
+            }));
+
+            // Check if there are more pages
+            let page_id = dir_listing.directory_listing.page_id.clone();
+            if page_id.is_none() {
+                break;
+            }
+
+            start_after = page_id;
+        }
+
+        Ok(objects)
+    }
 }
 
 #[async_trait]
@@ -685,14 +767,28 @@ impl ListClient for Arc<SAPHdlfsClient> {
         let default_prefix = prefix.unwrap_or("/");
         let sub_path1 = default_prefix.strip_suffix(LIST_DLT_SUFFIX1);
         let sub_path2 = default_prefix.strip_suffix(LIST_DLT_SUFFIX2);
+        let sub_path_recursive = default_prefix.strip_suffix(LIST_FILES_SUFFIX3);
         let path = Path::from(default_prefix);
         trace_log!(
             self,
-            "list_request  default_prefix: {:?}  sub_path1: {:?}, sub_path2: {:?}",
+            "list_request  default_prefix: {:?}  sub_path1: {:?}, sub_path2: {:?}, sub_path_recursive: {:?}",
             default_prefix,
             sub_path1,
-            sub_path2
+            sub_path2,
+            sub_path_recursive
         );
+
+        // Check for recursive listing suffix first
+        if let Some(recursive_path) = sub_path_recursive {
+            let objects = self.list_files_recursive(recursive_path).await?;
+            return Ok(PaginatedListResult {
+                result: ListResult {
+                    common_prefixes: Vec::new(),
+                    objects,
+                },
+                page_token: None,
+            });
+        }
 
         let (recursion_depth, list_path) = match (sub_path1, sub_path2) {
             (Some(path), _) => (1, path),
