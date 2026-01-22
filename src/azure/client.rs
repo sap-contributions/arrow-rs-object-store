@@ -20,25 +20,25 @@ use crate::azure::credential::*;
 use crate::azure::{AzureCredentialProvider, STORE};
 use crate::client::builder::HttpRequestBuilder;
 use crate::client::get::GetClient;
-use crate::client::header::{get_put_result, HeaderConfig};
+use crate::client::header::{HeaderConfig, get_put_result};
 use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
 use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpRequest, HttpResponse};
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
-use crate::util::{deserialize_rfc1123, GetRange};
+use crate::util::{GetRange, deserialize_rfc1123};
 use crate::{
     Attribute, Attributes, ClientOptions, GetOptions, ListResult, ObjectMeta, Path, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, RetryConfig, TagSet,
 };
 use async_trait::async_trait;
-use base64::prelude::{BASE64_STANDARD, BASE64_STANDARD_NO_PAD};
 use base64::Engine;
+use base64::prelude::{BASE64_STANDARD, BASE64_STANDARD_NO_PAD};
 use bytes::{Buf, Bytes};
 use chrono::{DateTime, Utc};
 use http::{
-    header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, IF_MATCH, IF_NONE_MATCH},
     HeaderName, Method,
+    header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, IF_MATCH, IF_NONE_MATCH},
 };
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
@@ -70,12 +70,6 @@ pub(crate) enum Error {
 
     #[error("Error performing put request {}: {}", path, source)]
     PutRequest {
-        source: crate::client::retry::RetryError,
-        path: String,
-    },
-
-    #[error("Error performing delete request {}: {}", path, source)]
-    DeleteRequest {
         source: crate::client::retry::RetryError,
         path: String,
     },
@@ -150,9 +144,9 @@ pub(crate) enum Error {
 impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
         match err {
-            Error::GetRequest { source, path }
-            | Error::DeleteRequest { source, path }
-            | Error::PutRequest { source, path } => source.error(STORE, path),
+            Error::GetRequest { source, path } | Error::PutRequest { source, path } => {
+                source.error(STORE, path)
+            }
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -497,7 +491,7 @@ async fn parse_blob_batch_delete_body(
                     code: code.to_string(),
                     reason: part_response.reason.unwrap_or_default().to_string(),
                 }
-                .into())
+                .into());
             }
             _ => return Err(invalid_response("missing part response status code").into()),
         }
@@ -625,36 +619,6 @@ impl AzureClient {
 
         Ok(get_put_result(response.headers(), VERSION_HEADER)
             .map_err(|source| Error::Metadata { source })?)
-    }
-
-    /// Make an Azure Delete request <https://docs.microsoft.com/en-us/rest/api/storageservices/delete-blob>
-    pub(crate) async fn delete_request<T: Serialize + ?Sized + Sync>(
-        &self,
-        path: &Path,
-        query: &T,
-    ) -> Result<()> {
-        let credential = self.get_credential().await?;
-        let url = self.config.path_url(path);
-
-        let sensitive = credential
-            .as_deref()
-            .map(|c| c.sensitive_request())
-            .unwrap_or_default();
-        self.client
-            .delete(url.as_str())
-            .query(query)
-            .header(&DELETE_SNAPSHOTS, "include")
-            .with_azure_authorization(&credential, &self.config.account)
-            .retryable(&self.config.retry_config)
-            .sensitive(sensitive)
-            .send()
-            .await
-            .map_err(|source| {
-                let path = path.as_ref().into();
-                Error::DeleteRequest { source, path }
-            })?;
-
-        Ok(())
     }
 
     fn build_bulk_delete_body(

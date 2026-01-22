@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::ObjectStore;
 #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 use crate::local::LocalFileSystem;
 use crate::memory::InMemory;
 use crate::path::Path;
-use crate::ObjectStore;
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
@@ -52,7 +52,7 @@ impl From<Error> for super::Error {
 /// - `memory:///` -> [`InMemory`]
 /// - `s3://bucket/path` -> [`AmazonS3`](crate::aws::AmazonS3) (also supports `s3a`)
 /// - `gs://bucket/path` -> [`GoogleCloudStorage`](crate::gcp::GoogleCloudStorage)
-/// - `az://account/container/path` -> [`MicrosoftAzure`](crate::azure::MicrosoftAzure) (also supports `adl`, `azure`, `abfs`, `abfss`)
+/// - `[az|abfs[s]]://container[@<account>.<host>]/path` -> [`MicrosoftAzure`](crate::azure::MicrosoftAzure)
 /// - `http://mydomain/path` -> [`HttpStore`](crate::http::HttpStore)
 /// - `https://mydomain/path` -> [`HttpStore`](crate::http::HttpStore)
 ///
@@ -238,7 +238,7 @@ where
             return Err(super::Error::Generic {
                 store: "parse_url",
                 source: format!("feature for {s:?} not enabled").into(),
-            })
+            });
         }
     };
 
@@ -307,11 +307,35 @@ mod tests {
                 (ObjectStoreScheme::MicrosoftAzure, "path"),
             ),
             (
-                "az://account/container",
-                (ObjectStoreScheme::MicrosoftAzure, ""),
+                "az://container/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
             ),
             (
-                "az://account/container/path",
+                "az://container@account/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "abfs://container/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "abfs://container@account/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "abfss://container/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "abfss://container@account/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "adl://container/path",
+                (ObjectStoreScheme::MicrosoftAzure, "path"),
+            ),
+            (
+                "adl://container@account/path",
                 (ObjectStoreScheme::MicrosoftAzure, "path"),
             ),
             (
@@ -409,8 +433,8 @@ mod tests {
     #[tokio::test]
     #[cfg(all(feature = "http", not(target_arch = "wasm32")))]
     async fn test_url_http() {
-        use crate::client::mock_server::MockServer;
-        use http::{header::USER_AGENT, Response};
+        use crate::{ObjectStoreExt, client::mock_server::MockServer};
+        use http::{Response, header::USER_AGENT};
 
         let server = MockServer::new().await;
 

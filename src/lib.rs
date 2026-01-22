@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![warn(
     missing_copy_implementations,
@@ -61,6 +61,11 @@
 //! [crates.io]: https://github.com/rust-lang/crates.io
 //! [ACID]: https://en.wikipedia.org/wiki/ACID
 //! [S3]: https://aws.amazon.com/s3/
+//!
+//! # APIs
+//!
+//! * [`ObjectStore`]: Core object store API
+//! * [`ObjectStoreExt`]: (*New in 0.13.0*) Extension trait with additional convenience methods
 //!
 //! # Available [`ObjectStore`] Implementations
 //!
@@ -204,7 +209,7 @@
 //!
 //! # Fetch objects
 //!
-//! Use the [`ObjectStore::get`] method to fetch the data bytes
+//! Use the [`ObjectStoreExt::get`] / [`ObjectStore::get_opts`] method to fetch the data bytes
 //! from remote storage or files in the local filesystem as a stream.
 //!
 //! ```ignore-wasm32
@@ -212,7 +217,7 @@
 //! # use object_store::local::LocalFileSystem;
 //! # use std::sync::Arc;
 //! #  use bytes::Bytes;
-//! # use object_store::{path::Path, ObjectStore, GetResult};
+//! # use object_store::{path::Path, ObjectStore, ObjectStoreExt, GetResult};
 //! # fn get_object_store() -> Arc<dyn ObjectStore> {
 //! #   Arc::new(LocalFileSystem::new())
 //! # }
@@ -252,11 +257,11 @@
 //!
 //! # Put Object
 //!
-//! Use the [`ObjectStore::put`] method to atomically write data.
+//! Use the [`ObjectStoreExt::put`] method to atomically write data.
 //!
 //! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
-//! # use object_store::{ObjectStore, PutPayload};
+//! # use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 //! # use std::sync::Arc;
 //! # use object_store::path::Path;
 //! # fn get_object_store() -> Arc<dyn ObjectStore> {
@@ -273,11 +278,12 @@
 //!
 //! # Multipart Upload
 //!
-//! Use the [`ObjectStore::put_multipart`] method to atomically write a large amount of data
+//! Use the [`ObjectStoreExt::put_multipart`] / [`ObjectStore::put_multipart_opts`] method to atomically write a large
+//! amount of data
 //!
 //! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
-//! # use object_store::{ObjectStore, WriteMultipart};
+//! # use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
 //! # use std::sync::Arc;
 //! # use bytes::Bytes;
 //! # use tokio::io::AsyncWriteExt;
@@ -324,6 +330,32 @@
 //! # }
 //! ```
 //!
+//! To retrieve ranges from a versioned object, use [`ObjectStore::get_opts`] by specifying the range in the [`GetOptions`].
+//!
+//! ```ignore-wasm32
+//! # use object_store::local::LocalFileSystem;
+//! # use object_store::ObjectStore;
+//! # use object_store::GetOptions;
+//! # use std::sync::Arc;
+//! # use bytes::Bytes;
+//! # use tokio::io::AsyncWriteExt;
+//! # use object_store::path::Path;
+//! # fn get_object_store() -> Arc<dyn ObjectStore> {
+//! #   Arc::new(LocalFileSystem::new())
+//! # }
+//! # async fn get_range_with_options() {
+//! #
+//! let object_store: Arc<dyn ObjectStore> = get_object_store();
+//! let path = Path::from("data/large_file");
+//! let ranges = vec![90..100, 400..600, 0..10];
+//! for range in ranges {
+//!     let opts = GetOptions::default().with_range(Some(range));
+//!     let data = object_store.get_opts(&path, opts).await.unwrap();
+//!     // Do something with the data
+//! }
+//! # }
+//! ``````
+//!
 //! # Vectored Write
 //!
 //! When writing data it is often the case that the size of the output is not known ahead of time.
@@ -338,7 +370,7 @@
 //!
 //! ```ignore-wasm32
 //! # use object_store::local::LocalFileSystem;
-//! # use object_store::{ObjectStore, PutPayloadMut};
+//! # use object_store::{ObjectStore, ObjectStoreExt, PutPayloadMut};
 //! # use std::sync::Arc;
 //! # use bytes::Bytes;
 //! # use tokio::io::AsyncWriteExt;
@@ -376,7 +408,7 @@
 //! ```
 //! # use std::collections::btree_map::Entry;
 //! # use std::collections::HashMap;
-//! # use object_store::{GetOptions, GetResult, ObjectStore, Result, Error};
+//! # use object_store::{GetOptions, GetResult, ObjectStore, ObjectStoreExt, Result, Error};
 //! # use std::sync::Arc;
 //! # use std::time::{Duration, Instant};
 //! # use bytes::Bytes;
@@ -403,10 +435,7 @@
 //!             Some(e) => match e.refreshed_at.elapsed() < Duration::from_secs(10) {
 //!                 true => e.data.clone(), // Return cached data
 //!                 false => { // Check if remote version has changed
-//!                     let opts = GetOptions {
-//!                         if_none_match: Some(e.e_tag.clone()),
-//!                         ..GetOptions::default()
-//!                     };
+//!                     let opts = GetOptions::new().with_if_none_match(Some(e.e_tag.clone()));
 //!                     match self.store.get_opts(&path, opts).await {
 //!                         Ok(d) => e.data = d.bytes().await?,
 //!                         Err(Error::NotModified { .. }) => {} // Data has not changed
@@ -444,7 +473,7 @@
 //! storage, without relying on a separate DBMS.
 //!
 //! ```
-//! # use object_store::{Error, ObjectStore, PutMode, UpdateVersion};
+//! # use object_store::{Error, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 //! # use std::sync::Arc;
 //! # use bytes::Bytes;
 //! # use tokio::io::AsyncWriteExt;
@@ -536,8 +565,8 @@ pub mod client;
 
 #[cfg(feature = "cloud")]
 pub use client::{
-    backoff::BackoffConfig, retry::RetryConfig, ClientConfigKey, ClientOptions, CredentialProvider,
-    StaticCredentialProvider,
+    ClientConfigKey, ClientOptions, CredentialProvider, StaticCredentialProvider,
+    backoff::BackoffConfig, retry::RetryConfig,
 };
 
 #[cfg(all(feature = "cloud", not(target_arch = "wasm32")))]
@@ -564,10 +593,10 @@ pub mod integration;
 
 pub use attributes::*;
 
-pub use parse::{parse_url, parse_url_opts, ObjectStoreScheme};
+pub use parse::{ObjectStoreScheme, parse_url, parse_url_opts};
 pub use payload::*;
 pub use upload::*;
-pub use util::{coalesce_ranges, collect_bytes, GetRange, OBJECT_STORE_COALESCE_DEFAULT};
+pub use util::{GetRange, OBJECT_STORE_COALESCE_DEFAULT, coalesce_ranges, collect_bytes};
 
 // Re-export HTTP types used in public API
 pub use ::http::{Extensions, HeaderMap, HeaderValue};
@@ -578,7 +607,7 @@ use crate::util::maybe_spawn_blocking;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{stream::BoxStream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use std::fmt::{Debug, Formatter};
 #[cfg(all(feature = "fs", not(target_arch = "wasm32")))]
 use std::io::{Read, Seek, SeekFrom};
@@ -591,20 +620,130 @@ pub type DynObjectStore = dyn ObjectStore;
 /// Id type for multipart uploads.
 pub type MultipartId = String;
 
-/// Universal API to multiple object store services.
+/// Universal API for object store services.
+///
+/// See the [module-level documentation](crate) for a high level overview and
+/// examples. See [`ObjectStoreExt`] for additional convenience methods.
+///
+/// # Contract
+/// This trait is a contract between object store _implementations_
+/// (e.g. providers, wrappers) and the `object_store` crate itself. It is
+/// intended to be the minimum API required for an object store.
+///
+/// The [`ObjectStoreExt`] acts as an API/contract between `object_store` and
+/// the store _users_ and provides additional methods that may be simpler to use
+/// but overlap in functionality with [`ObjectStore`].
+///
+/// # Minimal Default Implementations
+/// There are only a few default implementations for methods in this trait by
+/// design. This was different from versions prior to `0.13.0`, which had many
+/// more default implementations. Default implementations are convenient for
+/// users, but error-prone for implementors as they require keeping the
+/// convenience APIs correctly in sync.
+///
+/// As of version 0.13.0, most methods on [`ObjectStore`] must be implemented, and
+/// the convenience methods have been moved to the [`ObjectStoreExt`] trait as
+/// described above. See [#385] for more details.
+///
+/// [#385]: https://github.com/apache/arrow-rs-object-store/issues/385
+///
+/// # Wrappers
+/// If you wrap an [`ObjectStore`] -- e.g. to add observability -- you SHOULD
+/// implement all trait methods. This ensures that defaults implementations
+/// that are overwritten by the wrapped store are also used by the wrapper.
+/// For example:
+///
+/// ```ignore
+/// struct MyStore {
+///     ...
+/// }
+///
+/// #[async_trait]
+/// impl ObjectStore for MyStore {
+///     // implement custom ranges handling
+///     async fn get_ranges(
+///         &self,
+///         location: &Path,
+///         ranges: &[Range<u64>],
+///     ) -> Result<Vec<Bytes>> {
+///         ...
+///     }
+///
+///     ...
+/// }
+///
+/// struct Wrapper {
+///     inner: Arc<dyn ObjectStore>,
+/// }
+///
+/// #[async_trait]
+/// #[deny(clippy::missing_trait_methods)]
+/// impl ObjectStore for Wrapper {
+///     // If we would not implement this method,
+///     // we would get the trait default and not
+///     // use the actual implementation of `inner`.
+///     async fn get_ranges(
+///         &self,
+///         location: &Path,
+///         ranges: &[Range<u64>],
+///     ) -> Result<Vec<Bytes>> {
+///         ...
+///     }
+///
+///     ...
+/// }
+/// ```
+///
+/// To automatically detect this issue, use
+/// [`#[deny(clippy::missing_trait_methods)]`](https://rust-lang.github.io/rust-clippy/master/index.html#missing_trait_methods).
+///
+/// # Upgrade Guide for 0.13.0
+///
+/// Upgrading to object_store 0.13.0 from an earlier version typically involves:
+///
+/// 1. Add a `use` for [`ObjectStoreExt`] to solve the error
+///
+/// ```text
+/// error[E0599]: no method named `put` found for reference `&dyn object_store::ObjectStore` in the current scope
+///    --> datafusion/datasource/src/url.rs:993:14
+/// ```
+///
+/// 2. Remove any (now) redundant implementations (such as `ObjectStore::put`) from any
+///   `ObjectStore` implementations to resolve the error
+///
+/// ```text
+/// error[E0407]: method `put` is not a member of trait `ObjectStore`
+///     --> datafusion/datasource/src/url.rs:1103:9
+///      |
+/// ```
+///
+/// 3. Convert `ObjectStore::delete` to [`ObjectStore::delete_stream`] (see documentation
+///    on that method for details and examples)
+///
+/// 4. Combine `ObjectStore::copy` and `ObjectStore::copy_if_not_exists` implementations into
+///    [`ObjectStore::copy_opts`] (see documentation on that method for details and examples)
+///
+/// 5. Update `object_store::Error::NotImplemented` to include the name of the missing method
+///
+/// For example, change instances of
+/// ```text
+/// object_store::Error::NotImplemented
+/// ```
+/// to
+/// ```
+/// object_store::Error::NotImplemented {
+///    operation: "put".to_string(),
+///    implementer: "RequestCountingObjectStore".to_string(),
+///  };
+/// ```
+///
 #[async_trait]
 pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
-    /// Save the provided bytes to the specified location
+    /// Save the provided `payload` to `location` with the given options
     ///
     /// The operation is guaranteed to be atomic, it will either successfully
     /// write the entirety of `payload` to `location`, or fail. No clients
     /// should be able to observe a partially written object
-    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-        self.put_opts(location, payload, PutOptions::default())
-            .await
-    }
-
-    /// Save the provided `payload` to `location` with the given options
     async fn put_opts(
         &self,
         location: &Path,
@@ -612,20 +751,9 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         opts: PutOptions,
     ) -> Result<PutResult>;
 
-    /// Perform a multipart upload
-    ///
-    /// Client should prefer [`ObjectStore::put`] for small payloads, as streaming uploads
-    /// typically require multiple separate requests. See [`MultipartUpload`] for more information
-    ///
-    /// For more advanced multipart uploads see [`MultipartStore`](multipart::MultipartStore)
-    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-        self.put_multipart_opts(location, PutMultipartOptions::default())
-            .await
-    }
-
     /// Perform a multipart upload with options
     ///
-    /// Client should prefer [`ObjectStore::put`] for small payloads, as streaming uploads
+    /// Client should prefer [`ObjectStore::put_opts`] for small payloads, as streaming uploads
     /// typically require multiple separate requests. See [`MultipartUpload`] for more information
     ///
     /// For more advanced multipart uploads see [`MultipartStore`](multipart::MultipartStore)
@@ -635,25 +763,127 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>>;
 
-    /// Return the bytes that are stored at the specified location.
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        self.get_opts(location, GetOptions::default()).await
-    }
-
     /// Perform a get request with options
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult>;
-
-    /// Return the bytes that are stored at the specified location
-    /// in the given byte range.
     ///
-    /// See [`GetRange::Bounded`] for more details on how `range` gets interpreted
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        let options = GetOptions {
-            range: Some(range.into()),
-            ..Default::default()
-        };
-        self.get_opts(location, options).await?.bytes().await
-    }
+    /// ## Example
+    ///
+    /// This example uses a basic local filesystem object store to get an object with a specific etag.
+    /// On the local filesystem, supplying an invalid etag will error.
+    /// Versioned object stores will return the specified object version, if it exists.
+    ///
+    /// ```ignore-wasm32
+    /// # use object_store::local::LocalFileSystem;
+    /// # use tempfile::tempdir;
+    /// # use object_store::{path::Path, ObjectStore, ObjectStoreExt, GetOptions};
+    /// async fn get_opts_example() {
+    ///     let tmp = tempdir().unwrap();
+    ///     let store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
+    ///     let location = Path::from("example.txt");
+    ///     let content = b"Hello, Object Store!";
+    ///
+    ///     // Put the object into the store
+    ///     store
+    ///         .put(&location, content.as_ref().into())
+    ///         .await
+    ///         .expect("Failed to put object");
+    ///
+    ///     // Get the object from the store to figure out the right etag
+    ///     let result: object_store::GetResult = store.get(&location).await.expect("Failed to get object");
+    ///
+    ///     let etag = result.meta.e_tag.expect("ETag should be present");
+    ///
+    ///     // Get the object from the store with range and etag
+    ///     let bytes = store
+    ///         .get_opts(
+    ///             &location,
+    ///             GetOptions::new()
+    ///                 .with_if_match(Some(etag.clone())),
+    ///         )
+    ///         .await
+    ///         .expect("Failed to get object with range and etag")
+    ///         .bytes()
+    ///         .await
+    ///         .expect("Failed to read bytes");
+    ///
+    ///     println!(
+    ///         "Retrieved with ETag {}: {}",
+    ///         etag,
+    ///         String::from_utf8_lossy(&bytes)
+    ///     );
+    ///
+    ///     // Show that if the etag does not match, we get an error
+    ///     let wrong_etag = "wrong-etag".to_string();
+    ///     match store
+    ///         .get_opts(
+    ///             &location,
+    ///             GetOptions::new().with_if_match(Some(wrong_etag))
+    ///         )
+    ///         .await
+    ///     {
+    ///         Ok(_) => println!("Unexpectedly succeeded with wrong ETag"),
+    ///         Err(e) => println!("On a non-versioned object store, getting an invalid ETag ('wrong-etag') results in an error as expected: {}", e),
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// To retrieve a range of bytes from a versioned object, specify the range in the [`GetOptions`] supplied to this method.
+    ///
+    /// ```ignore-wasm32
+    /// # use object_store::local::LocalFileSystem;
+    /// # use tempfile::tempdir;
+    /// # use object_store::{path::Path, ObjectStore, ObjectStoreExt, GetOptions};
+    /// async fn get_opts_range_example() {
+    ///     let tmp = tempdir().unwrap();
+    ///     let store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
+    ///     let location = Path::from("example.txt");
+    ///     let content = b"Hello, Object Store!";
+    ///
+    ///     // Put the object into the store
+    ///     store
+    ///         .put(&location, content.as_ref().into())
+    ///         .await
+    ///         .expect("Failed to put object");
+    ///
+    ///     // Get the object from the store to figure out the right etag
+    ///     let result: object_store::GetResult = store.get(&location).await.expect("Failed to get object");
+    ///
+    ///     let etag = result.meta.e_tag.expect("ETag should be present");
+    ///
+    ///     // Get the object from the store with range and etag
+    ///     let bytes = store
+    ///         .get_opts(
+    ///             &location,
+    ///             GetOptions::new()
+    ///                 .with_range(Some(0..5))
+    ///                 .with_if_match(Some(etag.clone())),
+    ///         )
+    ///         .await
+    ///         .expect("Failed to get object with range and etag")
+    ///         .bytes()
+    ///         .await
+    ///         .expect("Failed to read bytes");
+    ///
+    ///     println!(
+    ///         "Retrieved range [0-5] with ETag {}: {}",
+    ///         etag,
+    ///         String::from_utf8_lossy(&bytes)
+    ///     );
+    ///
+    ///     // Show that if the etag does not match, we get an error
+    ///     let wrong_etag = "wrong-etag".to_string();
+    ///     match store
+    ///         .get_opts(
+    ///             &location,
+    ///             GetOptions::new().with_range(Some(0..5)).with_if_match(Some(wrong_etag))
+    ///         )
+    ///         .await
+    ///     {
+    ///         Ok(_) => println!("Unexpectedly succeeded with wrong ETag"),
+    ///         Err(e) => println!("On a non-versioned object store, getting an invalid ETag ('wrong-etag') results in an error as expected: {}", e),
+    ///     }
+    /// }
+    /// ```
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult>;
 
     /// Return the bytes that are stored at the specified location
     /// in the given byte ranges
@@ -666,24 +896,28 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         .await
     }
 
-    /// Return the metadata for the specified location
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let options = GetOptions {
-            head: true,
-            ..Default::default()
-        };
-        Ok(self.get_opts(location, options).await?.meta)
-    }
-
-    /// Delete the object at the specified location.
-    async fn delete(&self, location: &Path) -> Result<()>;
-
     /// Delete all the objects at the specified locations
     ///
     /// When supported, this method will use bulk operations that delete more
-    /// than one object per a request. The default implementation will call
-    /// the single object delete method for each location, but with up to 10
-    /// concurrent requests.
+    /// than one object per a request. Otherwise, the implementation may call
+    /// the single object delete method for each location.
+    ///
+    /// # Bulk Delete Support
+    ///
+    /// The following backends support native bulk delete operations:
+    ///
+    /// - **AWS (S3)**: Uses the native [DeleteObjects] API with batches of up to 1000 objects
+    /// - **Azure**: Uses the native [Blob Batch] API with batches of up to 256 objects
+    ///
+    /// The following backends use concurrent individual delete operations:
+    ///
+    /// - **GCP**: Performs individual delete requests with up to 10 concurrent operations
+    /// - **HTTP**: Performs individual delete requests with up to 10 concurrent operations
+    /// - **Local**: Performs individual file deletions with up to 10 concurrent operations
+    /// - **Memory**: Performs individual in-memory deletions sequentially
+    ///
+    /// [DeleteObjects]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html
+    /// [Blob Batch]: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch
     ///
     /// The returned stream yields the results of the delete operations in the
     /// same order as the input locations. However, some errors will be from
@@ -701,7 +935,7 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let root = tempfile::TempDir::new().unwrap();
     /// # let store = LocalFileSystem::new_with_prefix(root.path()).unwrap();
-    /// # use object_store::{ObjectStore, ObjectMeta};
+    /// # use object_store::{ObjectStore, ObjectStoreExt, ObjectMeta};
     /// # use object_store::path::Path;
     /// # use futures::{StreamExt, TryStreamExt};
     /// #
@@ -719,19 +953,115 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     /// # let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
     /// # rt.block_on(example()).unwrap();
     /// ```
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<'a, Result<Path>> {
-        locations
-            .map(|location| async {
-                let location = location?;
-                self.delete(&location).await?;
-                Ok(location)
-            })
-            .buffered(10)
-            .boxed()
-    }
+    ///
+    /// Note: Before version 0.13, `delete_stream` has a default implementation
+    /// that deletes each object with up to 10 concurrent requests. This default
+    /// behavior has been removed, and each implementation must now provide its
+    /// own `delete_stream` implementation explicitly. The following example
+    /// shows how to implement `delete_stream` to get the previous default
+    /// behavior.
+    ///
+    /// ```
+    /// # use async_trait::async_trait;
+    /// # use futures::stream::{BoxStream, StreamExt};
+    /// # use object_store::path::Path;
+    /// # use object_store::{
+    /// #     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    /// #     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    /// # };
+    /// # use std::fmt;
+    /// # use std::fmt::Debug;
+    /// # use std::sync::Arc;
+    /// #
+    /// # struct ExampleClient;
+    /// #
+    /// # impl ExampleClient {
+    /// #     async fn delete(&self, _path: &Path) -> Result<()> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// #
+    /// # struct ExampleStore {
+    /// #     client: Arc<ExampleClient>,
+    /// # }
+    /// #
+    /// # impl Debug for ExampleStore {
+    /// #     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// #         write!(f, "ExampleStore")
+    /// #     }
+    /// # }
+    /// #
+    /// # impl fmt::Display for ExampleStore {
+    /// #     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// #         write!(f, "ExampleStore")
+    /// #     }
+    /// # }
+    /// #
+    /// # #[async_trait]
+    /// # impl ObjectStore for ExampleStore {
+    /// #     async fn put_opts(&self, _: &Path, _: PutPayload, _: PutOptions) -> Result<PutResult> {
+    /// #         todo!()
+    /// #     }
+    /// #
+    /// #     async fn put_multipart_opts(
+    /// #         &self,
+    /// #         _: &Path,
+    /// #         _: PutMultipartOptions,
+    /// #     ) -> Result<Box<dyn MultipartUpload>> {
+    /// #         todo!()
+    /// #     }
+    /// #
+    /// #     async fn get_opts(&self, _: &Path, _: GetOptions) -> Result<GetResult> {
+    /// #         todo!()
+    /// #     }
+    /// #
+    /// fn delete_stream(
+    ///     &self,
+    ///     locations: BoxStream<'static, Result<Path>>,
+    /// ) -> BoxStream<'static, Result<Path>> {
+    ///     let client = Arc::clone(&self.client);
+    ///     locations
+    ///         .map(move |location| {
+    ///             let client = Arc::clone(&client);
+    ///             async move {
+    ///                 let location = location?;
+    ///                 client.delete(&location).await?;
+    ///                 Ok(location)
+    ///             }
+    ///         })
+    ///         .buffered(10)
+    ///         .boxed()
+    /// }
+    /// #
+    /// #     fn list(&self, _: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+    /// #         todo!()
+    /// #     }
+    /// #
+    /// #     async fn list_with_delimiter(&self, _: Option<&Path>) -> Result<ListResult> {
+    /// #         todo!()
+    /// #     }
+    /// #
+    /// #     async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> Result<()> {
+    /// #         todo!()
+    /// #     }
+    /// # }
+    /// #
+    /// # async fn example() {
+    /// #     let store = ExampleStore { client: Arc::new(ExampleClient) };
+    /// #     let paths = futures::stream::iter(vec![Ok(Path::from("foo")), Ok(Path::from("bar"))]).boxed();
+    /// #     let results = store.delete_stream(paths).collect::<Vec<_>>().await;
+    /// #     assert_eq!(results.len(), 2);
+    /// #     assert_eq!(results[0].as_ref().unwrap(), &Path::from("foo"));
+    /// #     assert_eq!(results[1].as_ref().unwrap(), &Path::from("bar"));
+    /// # }
+    /// #
+    /// # let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    /// # rt.block_on(example());
+    /// ```
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>>;
 
     /// List all the objects with the given prefix.
     ///
@@ -771,47 +1101,36 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult>;
 
     /// Copy an object from one path to another in the same object store.
-    ///
-    /// If there exists an object at the destination, it will be overwritten.
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()>;
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()>;
 
     /// Move an object from one path to another in the same object store.
     ///
     /// By default, this is implemented as a copy and then delete source. It may not
     /// check when deleting source that it was the same object that was originally copied.
-    ///
-    /// If there exists an object at the destination, it will be overwritten.
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        self.copy(from, to).await?;
-        self.delete(from).await
-    }
-
-    /// Copy an object from one path to another, only if destination is empty.
-    ///
-    /// Will return an error if the destination already has an object.
-    ///
-    /// Performs an atomic operation if the underlying object storage supports it.
-    /// If atomic operations are not supported by the underlying object storage (like S3)
-    /// it will return an error.
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()>;
-
-    /// Move an object from one path to another in the same object store.
-    ///
-    /// Will return an error if the destination already has an object.
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.copy_if_not_exists(from, to).await?;
-        self.delete(from).await
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+        let RenameOptions {
+            target_mode,
+            extensions,
+        } = options;
+        let copy_mode = match target_mode {
+            RenameTargetMode::Overwrite => CopyMode::Overwrite,
+            RenameTargetMode::Create => CopyMode::Create,
+        };
+        let copy_options = CopyOptions {
+            mode: copy_mode,
+            extensions,
+        };
+        self.copy_opts(from, to, copy_options).await?;
+        self.delete(from).await?;
+        Ok(())
     }
 }
 
 macro_rules! as_ref_impl {
     ($type:ty) => {
         #[async_trait]
-        impl ObjectStore for $type {
-            async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-                self.as_ref().put(location, payload).await
-            }
-
+        #[deny(clippy::missing_trait_methods)]
+        impl<T: ObjectStore + ?Sized> ObjectStore for $type {
             async fn put_opts(
                 &self,
                 location: &Path,
@@ -819,10 +1138,6 @@ macro_rules! as_ref_impl {
                 opts: PutOptions,
             ) -> Result<PutResult> {
                 self.as_ref().put_opts(location, payload, opts).await
-            }
-
-            async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-                self.as_ref().put_multipart(location).await
             }
 
             async fn put_multipart_opts(
@@ -833,16 +1148,8 @@ macro_rules! as_ref_impl {
                 self.as_ref().put_multipart_opts(location, opts).await
             }
 
-            async fn get(&self, location: &Path) -> Result<GetResult> {
-                self.as_ref().get(location).await
-            }
-
             async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
                 self.as_ref().get_opts(location, options).await
-            }
-
-            async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-                self.as_ref().get_range(location, range).await
             }
 
             async fn get_ranges(
@@ -853,18 +1160,10 @@ macro_rules! as_ref_impl {
                 self.as_ref().get_ranges(location, ranges).await
             }
 
-            async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-                self.as_ref().head(location).await
-            }
-
-            async fn delete(&self, location: &Path) -> Result<()> {
-                self.as_ref().delete(location).await
-            }
-
-            fn delete_stream<'a>(
-                &'a self,
-                locations: BoxStream<'a, Result<Path>>,
-            ) -> BoxStream<'a, Result<Path>> {
+            fn delete_stream(
+                &self,
+                locations: BoxStream<'static, Result<Path>>,
+            ) -> BoxStream<'static, Result<Path>> {
                 self.as_ref().delete_stream(locations)
             }
 
@@ -884,27 +1183,219 @@ macro_rules! as_ref_impl {
                 self.as_ref().list_with_delimiter(prefix).await
             }
 
-            async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-                self.as_ref().copy(from, to).await
+            async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+                self.as_ref().copy_opts(from, to, options).await
             }
 
-            async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-                self.as_ref().rename(from, to).await
-            }
-
-            async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-                self.as_ref().copy_if_not_exists(from, to).await
-            }
-
-            async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-                self.as_ref().rename_if_not_exists(from, to).await
+            async fn rename_opts(
+                &self,
+                from: &Path,
+                to: &Path,
+                options: RenameOptions,
+            ) -> Result<()> {
+                self.as_ref().rename_opts(from, to, options).await
             }
         }
     };
 }
 
-as_ref_impl!(Arc<dyn ObjectStore>);
-as_ref_impl!(Box<dyn ObjectStore>);
+as_ref_impl!(Arc<T>);
+as_ref_impl!(Box<T>);
+
+/// Extension trait for [`ObjectStore`] with convenience functions.
+///
+/// See the [module-level documentation](crate) for a high leve overview and
+/// examples. See "contract" section within the [`ObjectStore`] documentation
+/// for more reasoning.
+///
+/// # Implementation
+/// You MUST NOT implement this trait yourself. It is automatically implemented for all [`ObjectStore`] implementations.
+pub trait ObjectStoreExt: ObjectStore {
+    /// Save the provided bytes to the specified location
+    ///
+    /// The operation is guaranteed to be atomic, it will either successfully
+    /// write the entirety of `payload` to `location`, or fail. No clients
+    /// should be able to observe a partially written object
+    fn put(&self, location: &Path, payload: PutPayload) -> impl Future<Output = Result<PutResult>>;
+
+    /// Perform a multipart upload
+    ///
+    /// Client should prefer [`ObjectStoreExt::put`] for small payloads, as streaming uploads
+    /// typically require multiple separate requests. See [`MultipartUpload`] for more information
+    ///
+    /// For more advanced multipart uploads see [`MultipartStore`](multipart::MultipartStore)
+    fn put_multipart(
+        &self,
+        location: &Path,
+    ) -> impl Future<Output = Result<Box<dyn MultipartUpload>>>;
+
+    /// Return the bytes that are stored at the specified location.
+    ///
+    /// ## Example
+    ///
+    /// This example uses a basic local filesystem object store to get an object.
+    ///
+    /// ```ignore-wasm32
+    /// # use object_store::local::LocalFileSystem;
+    /// # use tempfile::tempdir;
+    /// # use object_store::{path::Path, ObjectStore, ObjectStoreExt};
+    /// async fn get_example() {
+    ///     let tmp = tempdir().unwrap();
+    ///     let store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
+    ///     let location = Path::from("example.txt");
+    ///     let content = b"Hello, Object Store!";
+    ///
+    ///     // Put the object into the store
+    ///     store
+    ///         .put(&location, content.as_ref().into())
+    ///         .await
+    ///         .expect("Failed to put object");
+    ///
+    ///     // Get the object from the store
+    ///     let get_result = store.get(&location).await.expect("Failed to get object");
+    ///     let bytes = get_result.bytes().await.expect("Failed to read bytes");
+    ///     println!("Retrieved content: {}", String::from_utf8_lossy(&bytes));
+    /// }
+    /// ```
+    fn get(&self, location: &Path) -> impl Future<Output = Result<GetResult>>;
+
+    /// Return the bytes that are stored at the specified location
+    /// in the given byte range.
+    ///
+    /// See [`GetRange::Bounded`] for more details on how `range` gets interpreted.
+    ///
+    /// To retrieve a range of bytes from a versioned object, use [`ObjectStore::get_opts`] by specifying the range in the [`GetOptions`].
+    ///
+    /// ## Examples
+    ///
+    /// This example uses a basic local filesystem object store to get a byte range from an object.
+    ///
+    /// ```ignore-wasm32
+    /// # use object_store::local::LocalFileSystem;
+    /// # use tempfile::tempdir;
+    /// # use object_store::{path::Path, ObjectStore, ObjectStoreExt};
+    /// async fn get_range_example() {
+    ///     let tmp = tempdir().unwrap();
+    ///     let store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
+    ///     let location = Path::from("example.txt");
+    ///     let content = b"Hello, Object Store!";
+    ///
+    ///     // Put the object into the store
+    ///     store
+    ///         .put(&location, content.as_ref().into())
+    ///         .await
+    ///         .expect("Failed to put object");
+    ///
+    ///     // Get the object from the store
+    ///     let bytes = store
+    ///         .get_range(&location, 0..5)
+    ///         .await
+    ///         .expect("Failed to get object");
+    ///     println!("Retrieved range [0-5]: {}", String::from_utf8_lossy(&bytes));
+    /// }
+    /// ```
+    fn get_range(&self, location: &Path, range: Range<u64>) -> impl Future<Output = Result<Bytes>>;
+
+    /// Return the metadata for the specified location
+    fn head(&self, location: &Path) -> impl Future<Output = Result<ObjectMeta>>;
+
+    /// Delete the object at the specified location.
+    fn delete(&self, location: &Path) -> impl Future<Output = Result<()>>;
+
+    /// Copy an object from one path to another in the same object store.
+    ///
+    /// If there exists an object at the destination, it will be overwritten.
+    fn copy(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>>;
+
+    /// Copy an object from one path to another, only if destination is empty.
+    ///
+    /// Will return an error if the destination already has an object.
+    ///
+    /// Performs an atomic operation if the underlying object storage supports it.
+    /// If atomic operations are not supported by the underlying object storage (like S3)
+    /// it will return an error.
+    fn copy_if_not_exists(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>>;
+
+    /// Move an object from one path to another in the same object store.
+    ///
+    /// By default, this is implemented as a copy and then delete source. It may not
+    /// check when deleting source that it was the same object that was originally copied.
+    ///
+    /// If there exists an object at the destination, it will be overwritten.
+    fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>>;
+
+    /// Move an object from one path to another in the same object store.
+    ///
+    /// Will return an error if the destination already has an object.
+    fn rename_if_not_exists(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>>;
+}
+
+impl<T> ObjectStoreExt for T
+where
+    T: ObjectStore + ?Sized,
+{
+    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
+        self.put_opts(location, payload, PutOptions::default())
+            .await
+    }
+
+    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
+        self.put_multipart_opts(location, PutMultipartOptions::default())
+            .await
+    }
+
+    async fn get(&self, location: &Path) -> Result<GetResult> {
+        self.get_opts(location, GetOptions::default()).await
+    }
+
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
+        let options = GetOptions::new().with_range(Some(range));
+        self.get_opts(location, options).await?.bytes().await
+    }
+
+    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
+        let options = GetOptions::new().with_head(true);
+        Ok(self.get_opts(location, options).await?.meta)
+    }
+
+    async fn delete(&self, location: &Path) -> Result<()> {
+        let location = location.clone();
+        let mut stream =
+            self.delete_stream(futures::stream::once(async move { Ok(location) }).boxed());
+        let _path = stream.try_next().await?.ok_or_else(|| Error::Generic {
+            store: "ext",
+            source: "`delete_stream` with one location should yield once but didn't".into(),
+        })?;
+        if stream.next().await.is_some() {
+            Err(Error::Generic {
+                store: "ext",
+                source: "`delete_stream` with one location expected to yield exactly once, but yielded more than once".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        let options = CopyOptions::new().with_mode(CopyMode::Overwrite);
+        self.copy_opts(from, to, options).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+        let options = CopyOptions::new().with_mode(CopyMode::Create);
+        self.copy_opts(from, to, options).await
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let options = RenameOptions::new().with_target_mode(RenameTargetMode::Overwrite);
+        self.rename_opts(from, to, options).await
+    }
+
+    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+        let options = RenameOptions::new().with_target_mode(RenameTargetMode::Create);
+        self.rename_opts(from, to, options).await
+    }
+}
 
 /// Result of a list call that includes objects, prefixes (directories) and a
 /// token for the next set of results. Individual result sets may be limited to
@@ -1036,6 +1527,83 @@ impl GetOptions {
             }
         }
         Ok(())
+    }
+
+    /// Create a new [`GetOptions`]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the `if_match` condition.
+    ///
+    /// See [`GetOptions::if_match`]
+    #[must_use]
+    pub fn with_if_match(mut self, etag: Option<impl Into<String>>) -> Self {
+        self.if_match = etag.map(Into::into);
+        self
+    }
+
+    /// Sets the `if_none_match` condition.
+    ///
+    /// See [`GetOptions::if_none_match`]
+    #[must_use]
+    pub fn with_if_none_match(mut self, etag: Option<impl Into<String>>) -> Self {
+        self.if_none_match = etag.map(Into::into);
+        self
+    }
+
+    /// Sets the `if_modified_since` condition.
+    ///
+    /// See [`GetOptions::if_modified_since`]
+    #[must_use]
+    pub fn with_if_modified_since(mut self, dt: Option<impl Into<DateTime<Utc>>>) -> Self {
+        self.if_modified_since = dt.map(Into::into);
+        self
+    }
+
+    /// Sets the `if_unmodified_since` condition.
+    ///
+    /// See [`GetOptions::if_unmodified_since`]
+    #[must_use]
+    pub fn with_if_unmodified_since(mut self, dt: Option<impl Into<DateTime<Utc>>>) -> Self {
+        self.if_unmodified_since = dt.map(Into::into);
+        self
+    }
+
+    /// Sets the `range` condition.
+    ///
+    /// See [`GetOptions::range`]
+    #[must_use]
+    pub fn with_range(mut self, range: Option<impl Into<GetRange>>) -> Self {
+        self.range = range.map(Into::into);
+        self
+    }
+
+    /// Sets the `version` condition.
+    ///
+    /// See [`GetOptions::version`]
+    #[must_use]
+    pub fn with_version(mut self, version: Option<impl Into<String>>) -> Self {
+        self.version = version.map(Into::into);
+        self
+    }
+
+    /// Sets the `head` condition.
+    ///
+    /// See [`GetOptions::head`]
+    #[must_use]
+    pub fn with_head(mut self, head: impl Into<bool>) -> Self {
+        self.head = head.into();
+        self
+    }
+
+    /// Sets the `extensions` condition.
+    ///
+    /// See [`GetOptions::extensions`]
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions = extensions;
+        self
     }
 }
 
@@ -1188,7 +1756,7 @@ pub struct PutOptions {
     ///
     /// These extensions are ignored entirely by backends offered through this crate.
     ///
-    /// They are also eclused from [`PartialEq`] and [`Eq`].
+    /// They are also excluded from [`PartialEq`] and [`Eq`].
     pub extensions: Extensions,
 }
 
@@ -1260,7 +1828,7 @@ pub struct PutMultipartOptions {
     ///
     /// These extensions are ignored entirely by backends offered through this crate.
     ///
-    /// They are also eclused from [`PartialEq`] and [`Eq`].
+    /// They are also excluded from [`PartialEq`] and [`Eq`].
     pub extensions: Extensions,
 }
 
@@ -1310,6 +1878,143 @@ pub struct PutResult {
     /// A version indicator for the newly created object
     pub version: Option<String>,
 }
+
+/// Configure preconditions for the copy operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyMode {
+    /// Perform an atomic write operation, overwriting any object present at the provided path
+    #[default]
+    Overwrite,
+    /// Perform an atomic write operation, returning [`Error::AlreadyExists`] if an
+    /// object already exists at the provided path
+    Create,
+}
+
+/// Options for a copy request
+#[derive(Debug, Clone, Default)]
+pub struct CopyOptions {
+    /// Configure the [`CopyMode`] for this operation
+    pub mode: CopyMode,
+    /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
+    /// that need to pass context-specific information (like tracing spans) via trait methods.
+    ///
+    /// These extensions are ignored entirely by backends offered through this crate.
+    ///
+    /// They are also excluded from [`PartialEq`] and [`Eq`].
+    pub extensions: Extensions,
+}
+
+impl CopyOptions {
+    /// Create a new [`CopyOptions`]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the `mode.
+    ///
+    /// See [`CopyOptions::mode`].
+    #[must_use]
+    pub fn with_mode(mut self, mode: CopyMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Sets the `extensions`.
+    ///
+    /// See [`CopyOptions::extensions`].
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions = extensions;
+        self
+    }
+}
+
+impl PartialEq<Self> for CopyOptions {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            mode,
+            extensions: _,
+        } = self;
+        let Self {
+            mode: mode_other,
+            extensions: _,
+        } = other;
+
+        mode == mode_other
+    }
+}
+
+impl Eq for CopyOptions {}
+
+/// Configure preconditions for the target of rename operation.
+///
+/// Note though that the source location may or not be deleted at the same time in an atomic operation. There is
+/// currently NO flag to control the atomicity of "delete source at the same time as creating the target".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenameTargetMode {
+    /// Perform a write operation on the target, overwriting any object present at the provided path.
+    #[default]
+    Overwrite,
+    /// Perform an atomic write operation of the target, returning [`Error::AlreadyExists`] if an
+    /// object already exists at the provided path.
+    Create,
+}
+
+/// Options for a rename request
+#[derive(Debug, Clone, Default)]
+pub struct RenameOptions {
+    /// Configure the [`RenameTargetMode`] for this operation
+    pub target_mode: RenameTargetMode,
+    /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
+    /// that need to pass context-specific information (like tracing spans) via trait methods.
+    ///
+    /// These extensions are ignored entirely by backends offered through this crate.
+    ///
+    /// They are also excluded from [`PartialEq`] and [`Eq`].
+    pub extensions: Extensions,
+}
+
+impl RenameOptions {
+    /// Create a new [`RenameOptions`]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the `target_mode=.
+    ///
+    /// See [`RenameOptions::target_mode`].
+    #[must_use]
+    pub fn with_target_mode(mut self, target_mode: RenameTargetMode) -> Self {
+        self.target_mode = target_mode;
+        self
+    }
+
+    /// Sets the `extensions`.
+    ///
+    /// See [`RenameOptions::extensions`].
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions = extensions;
+        self
+    }
+}
+
+impl PartialEq<Self> for RenameOptions {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            target_mode,
+            extensions: _,
+        } = self;
+        let Self {
+            target_mode: target_mode_other,
+            extensions: _,
+        } = other;
+
+        target_mode == target_mode_other
+    }
+}
+
+impl Eq for RenameOptions {}
 
 /// A specialized `Result` for object store-related errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1387,8 +2092,17 @@ pub enum Error {
     },
 
     /// Error when an operation is not implemented
-    #[error("Operation not yet implemented.")]
-    NotImplemented,
+    #[error("Operation {operation} not yet implemented by {implementer}.")]
+    NotImplemented {
+        /// What isn't implemented. Should include at least the method
+        /// name that was called; could also include other relevant
+        /// subcontexts.
+        operation: String,
+
+        /// Which driver this is that hasn't implemented this operation,
+        /// to aid debugging in contexts that may be using multiple implementations.
+        implementer: String,
+    },
 
     /// Error when the used credentials don't have enough permission
     /// to perform the requested operation
@@ -1440,9 +2154,8 @@ impl From<Error> for std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffered::BufWriter;
+
     use chrono::TimeZone;
-    use tokio::io::AsyncWriteExt;
 
     macro_rules! maybe_skip_integration {
         () => {
@@ -1494,6 +2207,9 @@ mod tests {
     {
         use bytes::Buf;
         use serde::Deserialize;
+        use tokio::io::AsyncWriteExt;
+
+        use crate::buffered::BufWriter;
 
         #[derive(Deserialize)]
         struct Tagging {
@@ -1671,5 +2387,61 @@ mod tests {
         let mut extensions = Extensions::new();
         extensions.insert("test-key");
         assert!(extensions.get::<&str>().is_some());
+    }
+
+    #[test]
+    fn test_get_options_builder() {
+        let dt = Utc::now();
+        let extensions = Extensions::new();
+
+        let options = GetOptions::new();
+
+        // assert defaults
+        assert_eq!(options.if_match, None);
+        assert_eq!(options.if_none_match, None);
+        assert_eq!(options.if_modified_since, None);
+        assert_eq!(options.if_unmodified_since, None);
+        assert_eq!(options.range, None);
+        assert_eq!(options.version, None);
+        assert!(!options.head);
+        assert!(options.extensions.get::<&str>().is_none());
+
+        let options = options
+            .with_if_match(Some("etag-match"))
+            .with_if_none_match(Some("etag-none-match"))
+            .with_if_modified_since(Some(dt))
+            .with_if_unmodified_since(Some(dt))
+            .with_range(Some(0..100))
+            .with_version(Some("version-1"))
+            .with_head(true)
+            .with_extensions(extensions.clone());
+
+        assert_eq!(options.if_match, Some("etag-match".to_string()));
+        assert_eq!(options.if_none_match, Some("etag-none-match".to_string()));
+        assert_eq!(options.if_modified_since, Some(dt));
+        assert_eq!(options.if_unmodified_since, Some(dt));
+        assert_eq!(options.range, Some(GetRange::Bounded(0..100)));
+        assert_eq!(options.version, Some("version-1".to_string()));
+        assert!(options.head);
+        assert_eq!(options.extensions.get::<&str>(), extensions.get::<&str>());
+    }
+
+    fn takes_generic_object_store<T: ObjectStore>(store: T) {
+        // This function is just to ensure that the trait bounds are satisfied
+        let _ = store;
+    }
+    #[test]
+    fn test_dyn_impl() {
+        let store: Arc<dyn ObjectStore> = Arc::new(memory::InMemory::new());
+        takes_generic_object_store(store);
+        let store: Box<dyn ObjectStore> = Box::new(memory::InMemory::new());
+        takes_generic_object_store(store);
+    }
+    #[test]
+    fn test_generic_impl() {
+        let store = Arc::new(memory::InMemory::new());
+        takes_generic_object_store(store);
+        let store = Box::new(memory::InMemory::new());
+        takes_generic_object_store(store);
     }
 }

@@ -19,7 +19,7 @@
 //!
 //! ## Multipart uploads
 //!
-//! Multipart uploads can be initiated with the [ObjectStore::put_multipart] method.
+//! Multipart uploads can be initiated with the [`ObjectStore::put_multipart_opts`] method.
 //!
 //! If the writer fails for any reason, you may have parts uploaded to AWS but not
 //! used that you will be charged for. [`MultipartUpload::abort`] may be invoked to drop
@@ -37,16 +37,16 @@ use std::{sync::Arc, time::Duration};
 use url::Url;
 
 use crate::aws::client::{CompleteMultipartMode, PutPartPayload, RequestError, S3Client};
+use crate::client::CredentialProvider;
 use crate::client::get::GetClientExt;
 use crate::client::list::{ListClient, ListClientExt};
-use crate::client::CredentialProvider;
 use crate::multipart::{MultipartStore, PartId};
 use crate::signer::Signer;
 use crate::util::STRICT_ENCODE_SET;
 use crate::{
-    Error, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload, ObjectMeta,
-    ObjectStore, Path, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    UploadPart,
+    CopyMode, CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload,
+    ObjectMeta, ObjectStore, Path, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result, UploadPart,
 };
 
 static TAGS_HEADER: HeaderName = HeaderName::from_static("x-amz-tagging");
@@ -180,7 +180,11 @@ impl ObjectStore for AmazonS3 {
 
         match (mode, &self.client.config.conditional_put) {
             (PutMode::Overwrite, _) => request.idempotent(true).do_put().await,
-            (PutMode::Create, S3ConditionalPut::Disabled) => Err(Error::NotImplemented),
+            (PutMode::Create, S3ConditionalPut::Disabled) => Err(Error::NotImplemented {
+                operation:
+                    "`put_opts` with mode `PutMode::Create` when conditional put is disabled".into(),
+                implementer: self.to_string(),
+            }),
             (PutMode::Create, S3ConditionalPut::ETagMatch) => {
                 match request.header(&IF_NONE_MATCH, "*").do_put().await {
                     // Technically If-None-Match should return NotModified but some stores,
@@ -222,7 +226,12 @@ impl ObjectStore for AmazonS3 {
                             r => r,
                         }
                     }
-                    S3ConditionalPut::Disabled => Err(Error::NotImplemented),
+                    S3ConditionalPut::Disabled => Err(Error::NotImplemented {
+                        operation:
+                            "`put_opts` with mode `PutMode::Update` when conditional put is disabled"
+                                .into(),
+                        implementer: self.to_string(),
+                    }),
                 }
             }
         }
@@ -250,25 +259,24 @@ impl ObjectStore for AmazonS3 {
         self.client.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.client.request(Method::DELETE, location).send().await?;
-        Ok(())
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<'a, Result<Path>> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let client = Arc::clone(&self.client);
         locations
             .try_chunks(1_000)
-            .map(move |locations| async {
-                // Early return the error. We ignore the paths that have already been
-                // collected into the chunk.
-                let locations = locations.map_err(|e| e.1)?;
-                self.client
-                    .bulk_delete_request(locations)
-                    .await
-                    .map(futures::stream::iter)
+            .map(move |locations| {
+                let client = Arc::clone(&client);
+                async move {
+                    // Early return the error. We ignore the paths that have already been
+                    // collected into the chunk.
+                    let locations = locations.map_err(|e| e.1)?;
+                    client
+                        .bulk_delete_request(locations)
+                        .await
+                        .map(futures::stream::iter)
+                }
             })
             .buffered(20)
             .try_flatten()
@@ -301,77 +309,89 @@ impl ObjectStore for AmazonS3 {
         self.client.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        self.client
-            .copy_request(from, to)
-            .idempotent(true)
-            .send()
-            .await?;
-        Ok(())
-    }
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        let CopyOptions {
+            mode,
+            extensions: _,
+        } = options;
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let (k, v, status) = match &self.client.config.copy_if_not_exists {
-            Some(S3CopyIfNotExists::Header(k, v)) => (k, v, StatusCode::PRECONDITION_FAILED),
-            Some(S3CopyIfNotExists::HeaderWithStatus(k, v, status)) => (k, v, *status),
-            Some(S3CopyIfNotExists::Multipart) => {
-                let upload_id = self
-                    .client
-                    .create_multipart(to, PutMultipartOptions::default())
+        match mode {
+            CopyMode::Overwrite => {
+                self.client
+                    .copy_request(from, to)
+                    .idempotent(true)
+                    .send()
                     .await?;
-
-                let res = async {
-                    let part_id = self
-                        .client
-                        .put_part(to, &upload_id, 0, PutPartPayload::Copy(from))
-                        .await?;
-                    match self
-                        .client
-                        .complete_multipart(
-                            to,
-                            &upload_id,
-                            vec![part_id],
-                            CompleteMultipartMode::Create,
-                        )
-                        .await
-                    {
-                        Err(e @ Error::Precondition { .. }) => Err(Error::AlreadyExists {
-                            path: to.to_string(),
-                            source: Box::new(e),
-                        }),
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(e),
+                Ok(())
+            }
+            CopyMode::Create => {
+                let (k, v, status) = match &self.client.config.copy_if_not_exists {
+                    Some(S3CopyIfNotExists::Header(k, v)) => {
+                        (k, v, StatusCode::PRECONDITION_FAILED)
                     }
+                    Some(S3CopyIfNotExists::HeaderWithStatus(k, v, status)) => (k, v, *status),
+                    Some(S3CopyIfNotExists::Multipart) => {
+                        let upload_id = self
+                            .client
+                            .create_multipart(to, PutMultipartOptions::default())
+                            .await?;
+
+                        let res = async {
+                            let part_id = self
+                                .client
+                                .put_part(to, &upload_id, 0, PutPartPayload::Copy(from))
+                                .await?;
+                            match self
+                                .client
+                                .complete_multipart(
+                                    to,
+                                    &upload_id,
+                                    vec![part_id],
+                                    CompleteMultipartMode::Create,
+                                )
+                                .await
+                            {
+                                Err(e @ Error::Precondition { .. }) => Err(Error::AlreadyExists {
+                                    path: to.to_string(),
+                                    source: Box::new(e),
+                                }),
+                                Ok(_) => Ok(()),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        .await;
+
+                        // If the multipart upload failed, make a best effort attempt to
+                        // clean it up. It's the caller's responsibility to add a
+                        // lifecycle rule if guaranteed cleanup is required, as we
+                        // cannot protect against an ill-timed process crash.
+                        if res.is_err() {
+                            let _ = self.client.abort_multipart(to, &upload_id).await;
+                        }
+
+                        return res;
+                    }
+                    None => {
+                        return Err(Error::NotSupported {
+                            source: "S3 does not support copy-if-not-exists".to_string().into(),
+                        });
+                    }
+                };
+
+                let req = self.client.copy_request(from, to);
+                match req.header(k, v).send().await {
+                    Err(RequestError::Retry { source, path })
+                        if source.status() == Some(status) =>
+                    {
+                        Err(Error::AlreadyExists {
+                            source: Box::new(source),
+                            path,
+                        })
+                    }
+                    Err(e) => Err(e.into()),
+                    Ok(_) => Ok(()),
                 }
-                .await;
-
-                // If the multipart upload failed, make a best effort attempt to
-                // clean it up. It's the caller's responsibility to add a
-                // lifecycle rule if guaranteed cleanup is required, as we
-                // cannot protect against an ill-timed process crash.
-                if res.is_err() {
-                    let _ = self.client.abort_multipart(to, &upload_id).await;
-                }
-
-                return res;
             }
-            None => {
-                return Err(Error::NotSupported {
-                    source: "S3 does not support copy-if-not-exists".to_string().into(),
-                })
-            }
-        };
-
-        let req = self.client.copy_request(from, to);
-        match req.header(k, v).send().await {
-            Err(RequestError::Retry { source, path }) if source.status() == Some(status) => {
-                Err(Error::AlreadyExists {
-                    source: Box::new(source),
-                    path,
-                })
-            }
-            Err(e) => Err(e.into()),
-            Ok(_) => Ok(()),
         }
     }
 }
@@ -493,14 +513,15 @@ impl PaginatedListStore for AmazonS3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ClientOptions;
+    use crate::ObjectStoreExt;
+    use crate::client::SpawnedReqwestConnector;
     use crate::client::get::GetClient;
     use crate::client::retry::RetryContext;
-    use crate::client::SpawnedReqwestConnector;
     use crate::integration::*;
     use crate::tests::*;
-    use crate::ClientOptions;
-    use base64::prelude::BASE64_STANDARD;
     use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
     use http::HeaderMap;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
@@ -534,6 +555,32 @@ mod tests {
         assert!(res.e_tag.is_some(), "Should have valid etag");
 
         store.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_multipart_file_with_signature() {
+        maybe_skip_integration!();
+
+        let bucket = "test-bucket-for-copy-if-not-exists";
+        let store = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .with_checksum_algorithm(Checksum::SHA256)
+            .with_copy_if_not_exists(S3CopyIfNotExists::Multipart)
+            .build()
+            .unwrap();
+
+        let src = Path::parse("src.bin").unwrap();
+        let dst = Path::parse("dst.bin").unwrap();
+        store
+            .put(&src, PutPayload::from(vec![0u8; 100_000]))
+            .await
+            .unwrap();
+        if store.head(&dst).await.is_ok() {
+            store.delete(&dst).await.unwrap();
+        }
+        store.copy_if_not_exists(&src, &dst).await.unwrap();
+        store.delete(&src).await.unwrap();
+        store.delete(&dst).await.unwrap();
     }
 
     #[tokio::test]

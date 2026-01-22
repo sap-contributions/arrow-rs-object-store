@@ -24,11 +24,11 @@ use crate::aws::{
     AmazonS3, AwsCredential, AwsCredentialProvider, Checksum, S3ConditionalPut, S3CopyIfNotExists,
     STORE,
 };
-use crate::client::{http_connector, HttpConnector, TokenCredentialProvider};
+use crate::client::{HttpConnector, TokenCredentialProvider, http_connector};
 use crate::config::ConfigValue;
 use crate::{ClientConfigKey, ClientOptions, Result, RetryConfig, StaticCredentialProvider};
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use itertools::Itertools;
 use md5::{Digest, Md5};
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -75,7 +75,10 @@ enum Error {
     #[error("Invalid Zone suffix for bucket '{bucket}'")]
     ZoneSuffix { bucket: String },
 
-    #[error("Invalid encryption type: {}. Valid values are \"AES256\", \"sse:kms\", \"sse:kms:dsse\" and \"sse-c\".", passed)]
+    #[error(
+        "Invalid encryption type: {}. Valid values are \"AES256\", \"sse:kms\", \"sse:kms:dsse\" and \"sse-c\".",
+        passed
+    )]
     InvalidEncryptionType { passed: String },
 
     #[error(
@@ -315,16 +318,28 @@ pub enum AmazonS3ConfigKey {
     /// Set the container credentials relative URI when used in ECS
     ///
     /// <https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html>
+    ///
+    /// Supported keys:
+    /// - `aws_container_credentials_relative_uri`
+    /// - `container_credentials_relative_uri`
     ContainerCredentialsRelativeUri,
 
     /// Set the container credentials full URI when used in EKS
     ///
     /// <https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html>
+    ///
+    /// Supported keys:
+    /// - `aws_container_credentials_full_uri`
+    /// - `container_credentials_full_uri`
     ContainerCredentialsFullUri,
 
     /// Set the authorization token in plain text when used in EKS to authenticate with ContainerCredentialsFullUri
     ///
     /// <https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html>
+    ///
+    /// Supported keys:
+    /// - `aws_container_authorization_token_file`
+    /// - `container_authorization_token_file`
     ContainerAuthorizationTokenFile,
 
     /// Web identity token file path for AssumeRoleWithWebIdentity
@@ -358,14 +373,26 @@ pub enum AmazonS3ConfigKey {
     /// Configure how to provide `copy_if_not_exists`
     ///
     /// See [`S3CopyIfNotExists`]
+    ///
+    /// Supported keys:
+    /// - `aws_copy_if_not_exists`
+    /// - `copy_if_not_exists`
     CopyIfNotExists,
 
     /// Configure how to provide conditional put operations
     ///
     /// See [`S3ConditionalPut`]
+    ///
+    /// Supported keys:
+    /// - `aws_conditional_put`
+    /// - `conditional_put`
     ConditionalPut,
 
     /// Skip signing request
+    ///
+    /// Supported keys:
+    /// - `aws_skip_signature`
+    /// - `skip_signature`
     SkipSignature,
 
     /// Disable tagging objects
@@ -452,9 +479,15 @@ impl FromStr for AmazonS3ConfigKey {
             "aws_metadata_endpoint" | "metadata_endpoint" => Ok(Self::MetadataEndpoint),
             "aws_unsigned_payload" | "unsigned_payload" => Ok(Self::UnsignedPayload),
             "aws_checksum_algorithm" | "checksum_algorithm" => Ok(Self::Checksum),
-            "aws_container_credentials_relative_uri" => Ok(Self::ContainerCredentialsRelativeUri),
-            "aws_container_credentials_full_uri" => Ok(Self::ContainerCredentialsFullUri),
-            "aws_container_authorization_token_file" => Ok(Self::ContainerAuthorizationTokenFile),
+            "aws_container_credentials_relative_uri" | "container_credentials_relative_uri" => {
+                Ok(Self::ContainerCredentialsRelativeUri)
+            }
+            "aws_container_credentials_full_uri" | "container_credentials_full_uri" => {
+                Ok(Self::ContainerCredentialsFullUri)
+            }
+            "aws_container_authorization_token_file" | "container_authorization_token_file" => {
+                Ok(Self::ContainerAuthorizationTokenFile)
+            }
             "aws_web_identity_token_file" | "web_identity_token_file" => {
                 Ok(Self::WebIdentityTokenFile)
             }
@@ -468,14 +501,16 @@ impl FromStr for AmazonS3ConfigKey {
             "aws_request_payer" | "request_payer" => Ok(Self::RequestPayer),
             // Backwards compatibility
             "aws_allow_http" => Ok(Self::Client(ClientConfigKey::AllowHttp)),
-            "aws_server_side_encryption" => Ok(Self::Encryption(
+            "aws_server_side_encryption" | "server_side_encryption" => Ok(Self::Encryption(
                 S3EncryptionConfigKey::ServerSideEncryption,
             )),
-            "aws_sse_kms_key_id" => Ok(Self::Encryption(S3EncryptionConfigKey::KmsKeyId)),
-            "aws_sse_bucket_key_enabled" => {
+            "aws_sse_kms_key_id" | "sse_kms_key_id" => {
+                Ok(Self::Encryption(S3EncryptionConfigKey::KmsKeyId))
+            }
+            "aws_sse_bucket_key_enabled" | "sse_bucket_key_enabled" => {
                 Ok(Self::Encryption(S3EncryptionConfigKey::BucketKeyEnabled))
             }
-            "aws_sse_customer_key_base64" => Ok(Self::Encryption(
+            "aws_sse_customer_key_base64" | "sse_customer_key_base64" => Ok(Self::Encryption(
                 S3EncryptionConfigKey::CustomerEncryptionKey,
             )),
             _ => match s.strip_prefix("aws_").unwrap_or(s).parse() {
@@ -724,6 +759,10 @@ impl AmazonS3Builder {
                     if let Some(bucket) = bucket {
                         self.bucket_name = Some(bucket.into());
                     }
+                }
+                Some((bucket, "s3", "amazonaws", "com")) => {
+                    self.bucket_name = Some(bucket.to_string());
+                    self.virtual_hosted_style_request = true.into();
                 }
                 Some((bucket, "s3", region, "amazonaws.com")) => {
                     self.bucket_name = Some(bucket.to_string());
@@ -1021,10 +1060,9 @@ impl AmazonS3Builder {
                 (Some(_), None, _) => return Err(Error::MissingSecretAccessKey.into()),
                 (None, None, _) => unreachable!(),
             }
-        } else if let (Ok(token_path), Ok(role_arn)) = (
-            std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE"),
-            std::env::var("AWS_ROLE_ARN"),
-        ) {
+        } else if let (Some(token_path), Some(role_arn)) =
+            (self.web_identity_token_file, self.role_arn)
+        {
             debug!("Using WebIdentity credential provider");
 
             let session_name = self
@@ -1191,17 +1229,41 @@ fn parse_bucket_az(bucket: &str) -> Option<&str> {
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum S3EncryptionConfigKey {
-    /// Type of encryption to use. If set, must be one of "AES256" (SSE-S3), "aws:kms" (SSE-KMS), "aws:kms:dsse" (DSSE-KMS) or "sse-c".
+    /// Type of encryption to use.
+    ///
+    /// If set, must be one of
+    /// - "AES256" (SSE-S3),
+    /// - "aws:kms" (SSE-KMS),
+    /// - "aws:kms:dsse" (DSSE-KMS) or
+    /// - "sse-c"
+    ///
+    /// Supported keys:
+    /// - `aws_server_side_encryption`
+    /// - `server_side_encryption`
     ServerSideEncryption,
-    /// The KMS key ID to use for server-side encryption. If set, ServerSideEncryption
-    /// must be "aws:kms" or "aws:kms:dsse".
+    /// The KMS key ID to use for server-side encryption.
+    ///
+    /// If set, [ServerSideEncryption](Self::ServerSideEncryption) must be "aws:kms" or "aws:kms:dsse".
+    ///
+    /// Supported keys:
+    /// - `aws_sse_kms_key_id`
+    /// - `sse_kms_key_id`
     KmsKeyId,
     /// If set to true, will use the bucket's default KMS key for server-side encryption.
     /// If set to false, will disable the use of the bucket's default KMS key for server-side encryption.
+    ///
+    /// Supported keys:
+    /// - `aws_sse_bucket_key_enabled`
+    /// - `sse_bucket_key_enabled`
     BucketKeyEnabled,
 
     /// The base64 encoded, 256-bit customer encryption key to use for server-side encryption.
-    /// If set, ServerSideEncryption must be "sse-c".
+    ///
+    /// If set, [ServerSideEncryption](Self::ServerSideEncryption) must be "sse-c".
+    ///
+    /// Supported keys:
+    /// - `aws_sse_customer_key_base64`
+    /// - `sse_customer_key_base64`
     CustomerEncryptionKey,
 }
 
@@ -1541,6 +1603,13 @@ mod tests {
             .unwrap();
         assert_eq!(builder.region, Some("region".to_string()));
         assert_eq!(builder.bucket_name, Some("bucket.with.dot".to_string()));
+
+        let mut builder = AmazonS3Builder::new();
+        builder
+            .parse_url("https://bucket.s3.amazonaws.com")
+            .unwrap();
+        assert_eq!(builder.bucket_name, Some("bucket".to_string()));
+        assert!(builder.virtual_hosted_style_request.get().unwrap());
 
         let mut builder = AmazonS3Builder::new();
         builder

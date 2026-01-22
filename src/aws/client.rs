@@ -19,12 +19,12 @@ use crate::aws::builder::S3EncryptionHeaders;
 use crate::aws::checksum::Checksum;
 use crate::aws::credential::{AwsCredential, CredentialExt};
 use crate::aws::{
-    AwsAuthorizer, AwsCredentialProvider, S3ConditionalPut, S3CopyIfNotExists, COPY_SOURCE_HEADER,
+    AwsAuthorizer, AwsCredentialProvider, COPY_SOURCE_HEADER, S3ConditionalPut, S3CopyIfNotExists,
     STORE, STRICT_PATH_ENCODE_SET, TAGS_HEADER,
 };
 use crate::client::builder::{HttpRequestBuilder, RequestBuilderError};
 use crate::client::get::GetClient;
-use crate::client::header::{get_etag, HeaderConfig};
+use crate::client::header::{HeaderConfig, get_etag};
 use crate::client::header::{get_put_result, get_version};
 use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
@@ -40,8 +40,8 @@ use crate::{
     PutPayload, PutResult, Result, RetryConfig, TagSet,
 };
 use async_trait::async_trait;
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use bytes::{Buf, Bytes};
 use http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
@@ -50,7 +50,7 @@ use http::header::{
 use http::{HeaderMap, HeaderName, Method};
 use itertools::Itertools;
 use md5::{Digest, Md5};
-use percent_encoding::{utf8_percent_encode, PercentEncode};
+use percent_encoding::{PercentEncode, utf8_percent_encode};
 use quick_xml::events::{self as xml_events};
 use ring::digest;
 use ring::digest::Context;
@@ -69,6 +69,7 @@ pub(crate) enum Error {
     #[error("Error performing DeleteObjects request: {}", source)]
     DeleteObjectsRequest {
         source: crate::client::retry::RetryError,
+        paths: Vec<String>,
     },
 
     #[error(
@@ -127,6 +128,7 @@ impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
         match err {
             Error::CompleteMultipartRequest { source, path } => source.error(STORE, path),
+            Error::DeleteObjectsRequest { source, paths } => source.error(STORE, paths.join(",")),
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -551,7 +553,10 @@ impl S3Client {
             .with_aws_sigv4(credential.authorizer(), Some(digest.as_ref()))
             .send_retry(&self.config.retry_config)
             .await
-            .map_err(|source| Error::DeleteObjectsRequest { source })?
+            .map_err(|source| Error::DeleteObjectsRequest {
+                source,
+                paths: paths.iter().map(|p| p.to_string()).collect(),
+            })?
             .into_body()
             .bytes()
             .await
@@ -701,24 +706,24 @@ impl S3Client {
             // If SSE-C is used, we must include the encryption headers in every upload request.
             request = request.with_encryption_headers();
         }
-        let (parts, body) = request.send().await?.into_parts();
-        let checksum_sha256 = parts
-            .headers
-            .get(SHA256_CHECKSUM)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string());
 
-        let e_tag = match is_copy {
-            false => get_etag(&parts.headers).map_err(|source| Error::Metadata { source })?,
-            true => {
-                let response = body
-                    .bytes()
-                    .await
-                    .map_err(|source| Error::CreateMultipartResponseBody { source })?;
-                let response: CopyPartResult = quick_xml::de::from_reader(response.reader())
-                    .map_err(|source| Error::InvalidMultipartResponse { source })?;
-                response.e_tag
-            }
+        let (parts, body) = request.send().await?.into_parts();
+        let (e_tag, checksum_sha256) = if is_copy {
+            let response = body
+                .bytes()
+                .await
+                .map_err(|source| Error::CreateMultipartResponseBody { source })?;
+            let response: CopyPartResult = quick_xml::de::from_reader(response.reader())
+                .map_err(|source| Error::InvalidMultipartResponse { source })?;
+            (response.e_tag, response.checksum_sha256)
+        } else {
+            let e_tag = get_etag(&parts.headers).map_err(|source| Error::Metadata { source })?;
+            let checksum_sha256 = parts
+                .headers
+                .get(SHA256_CHECKSUM)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string());
+            (e_tag, checksum_sha256)
         };
 
         let content_id = if self.config.checksum == Some(Checksum::SHA256) {
@@ -953,10 +958,10 @@ fn encode_path(path: &Path) -> PercentEncode<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::mock_server::MockServer;
     use crate::client::HttpClient;
-    use http::header::CONTENT_LENGTH;
+    use crate::client::mock_server::MockServer;
     use http::Response;
+    use http::header::CONTENT_LENGTH;
 
     #[tokio::test]
     async fn test_create_multipart_has_content_length() {

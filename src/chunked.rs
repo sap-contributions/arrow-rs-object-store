@@ -23,13 +23,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 
 use crate::path::Path;
 use crate::{
-    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutResult,
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutResult, RenameOptions,
 };
 use crate::{PutPayload, Result};
 
@@ -61,6 +61,7 @@ impl Display for ChunkedStore {
 }
 
 #[async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl ObjectStore for ChunkedStore {
     async fn put_opts(
         &self,
@@ -69,10 +70,6 @@ impl ObjectStore for ChunkedStore {
         opts: PutOptions,
     ) -> Result<PutResult> {
         self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart(location).await
     }
 
     async fn put_multipart_opts(
@@ -120,7 +117,7 @@ impl ObjectStore for ChunkedStore {
                                             source: Box::new(e),
                                         }),
                                         (stream, buffer, exhausted, chunk_size),
-                                    ))
+                                    ));
                                 }
                             };
                         }
@@ -138,16 +135,15 @@ impl ObjectStore for ChunkedStore {
         })
     }
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        self.inner.get_range(location, range).await
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.inner.get_ranges(location, ranges).await
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        self.inner.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -166,12 +162,12 @@ impl ObjectStore for ChunkedStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.copy(from, to).await
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+        self.inner.rename_opts(from, to, options).await
     }
 }
 
@@ -179,6 +175,7 @@ impl ObjectStore for ChunkedStore {
 mod tests {
     use futures::StreamExt;
 
+    use crate::ObjectStoreExt;
     #[cfg(feature = "fs")]
     use crate::integration::*;
     #[cfg(feature = "fs")]

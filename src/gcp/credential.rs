@@ -21,11 +21,11 @@ use crate::client::retry::RetryExt;
 use crate::client::token::TemporaryToken;
 use crate::client::{HttpClient, HttpError, TokenProvider};
 use crate::gcp::{GcpSigningCredentialProvider, STORE};
-use crate::util::{hex_digest, hex_encode, STRICT_ENCODE_SET};
+use crate::util::{STRICT_ENCODE_SET, hex_digest, hex_encode};
 use crate::{RetryConfig, StaticCredentialProvider};
 use async_trait::async_trait;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use futures::TryFutureExt;
 use http::{HeaderMap, Method};
@@ -91,7 +91,9 @@ pub enum Error {
     TokenResponseBody { source: HttpError },
 
     #[error("Error reading pem file: {}", source)]
-    ReadPem { source: std::io::Error },
+    ReadPem {
+        source: rustls_pki_types::pem::Error,
+    },
 }
 
 impl From<Error> for crate::Error {
@@ -127,19 +129,14 @@ pub struct ServiceAccountKey(RsaKeyPair);
 impl ServiceAccountKey {
     /// Parses a pem-encoded RSA key
     pub fn from_pem(encoded: &[u8]) -> Result<Self> {
-        use rustls_pemfile::Item;
-        use std::io::Cursor;
+        use rustls_pki_types::PrivateKeyDer;
+        use rustls_pki_types::pem::PemObject;
 
-        let mut cursor = Cursor::new(encoded);
-        let mut reader = BufReader::new(&mut cursor);
-
-        match rustls_pemfile::read_one(&mut reader) {
-            Ok(item) => match item {
-                Some(Item::Pkcs8Key(key)) => Self::from_pkcs8(key.secret_pkcs8_der()),
-                Some(Item::Pkcs1Key(key)) => Self::from_der(key.secret_pkcs1_der()),
-                _ => Err(Error::MissingKey),
-            },
-            Err(e) => Err(Error::ReadPem { source: e }),
+        match PrivateKeyDer::from_pem_slice(encoded) {
+            Ok(PrivateKeyDer::Pkcs8(key)) => Self::from_pkcs8(key.secret_pkcs8_der()),
+            Ok(PrivateKeyDer::Pkcs1(key)) => Self::from_der(key.secret_pkcs1_der()),
+            Ok(_) => Err(Error::MissingKey),
+            Err(source) => Err(Error::ReadPem { source }),
         }
     }
 

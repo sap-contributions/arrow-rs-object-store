@@ -18,9 +18,9 @@
 //! An object store that limits the maximum concurrency of the wrapped implementation
 
 use crate::{
-    BoxStream, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, Path, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, StreamExt,
-    UploadPart,
+    BoxStream, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, Path, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, Result, StreamExt, UploadPart,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -70,12 +70,8 @@ impl<T: ObjectStore> std::fmt::Display for LimitStore<T> {
 }
 
 #[async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl<T: ObjectStore> ObjectStore for LimitStore<T> {
-    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-        let _permit = self.semaphore.acquire().await.unwrap();
-        self.inner.put(location, payload).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -84,13 +80,6 @@ impl<T: ObjectStore> ObjectStore for LimitStore<T> {
     ) -> Result<PutResult> {
         let _permit = self.semaphore.acquire().await.unwrap();
         self.inner.put_opts(location, payload, opts).await
-    }
-    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-        let upload = self.inner.put_multipart(location).await?;
-        Ok(Box::new(LimitUpload {
-            semaphore: Arc::clone(&self.semaphore),
-            upload,
-        }))
     }
 
     async fn put_multipart_opts(
@@ -105,21 +94,10 @@ impl<T: ObjectStore> ObjectStore for LimitStore<T> {
         }))
     }
 
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        let permit = Arc::clone(&self.semaphore).acquire_owned().await.unwrap();
-        let r = self.inner.get(location).await?;
-        Ok(permit_get_result(r, permit))
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let permit = Arc::clone(&self.semaphore).acquire_owned().await.unwrap();
         let r = self.inner.get_opts(location, options).await?;
         Ok(permit_get_result(r, permit))
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        let _permit = self.semaphore.acquire().await.unwrap();
-        self.inner.get_range(location, range).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
@@ -127,21 +105,18 @@ impl<T: ObjectStore> ObjectStore for LimitStore<T> {
         self.inner.get_ranges(location, ranges).await
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let _permit = self.semaphore.acquire().await.unwrap();
-        self.inner.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let _permit = self.semaphore.acquire().await.unwrap();
-        self.inner.delete(location).await
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<'a, Result<Path>> {
-        self.inner.delete_stream(locations)
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let inner = Arc::clone(&self.inner);
+        let fut = Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .map(move |permit| {
+                let s = inner.delete_stream(locations);
+                PermitWrapper::new(s, permit.unwrap())
+            });
+        fut.into_stream().flatten().boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -178,24 +153,14 @@ impl<T: ObjectStore> ObjectStore for LimitStore<T> {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         let _permit = self.semaphore.acquire().await.unwrap();
-        self.inner.copy(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
         let _permit = self.semaphore.acquire().await.unwrap();
-        self.inner.rename(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let _permit = self.semaphore.acquire().await.unwrap();
-        self.inner.copy_if_not_exists(from, to).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let _permit = self.semaphore.acquire().await.unwrap();
-        self.inner.rename_if_not_exists(from, to).await
+        self.inner.rename_opts(from, to, options).await
     }
 }
 
@@ -276,10 +241,10 @@ impl MultipartUpload for LimitUpload {
 
 #[cfg(test)]
 mod tests {
+    use crate::ObjectStore;
     use crate::integration::*;
     use crate::limit::LimitStore;
     use crate::memory::InMemory;
-    use crate::ObjectStore;
     use futures::stream::StreamExt;
     use std::pin::Pin;
     use std::time::Duration;

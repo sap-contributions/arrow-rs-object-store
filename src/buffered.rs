@@ -19,8 +19,8 @@
 
 use crate::path::Path;
 use crate::{
-    Attributes, Extensions, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
-    PutPayloadMut, TagSet, WriteMultipart,
+    Attributes, Extensions, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions,
+    PutOptions, PutPayloadMut, TagSet, WriteMultipart,
 };
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
@@ -37,7 +37,7 @@ pub const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// An async-buffered reader compatible with the tokio IO traits
 ///
-/// Internally this maintains a buffer of the requested size, and uses [`ObjectStore::get_range`]
+/// Internally this maintains a buffer of the requested size, and uses [`ObjectStoreExt::get_range`]
 /// to populate its internal buffer once depleted. This buffer is cleared on seek.
 ///
 /// Whilst simple, this interface will typically be outperformed by the native [`ObjectStore`]
@@ -45,13 +45,14 @@ pub const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 /// very [high first-byte latencies], on the order of 100-200ms, and so avoiding unnecessary
 /// round-trips is critical to throughput.
 ///
-/// Systems looking to sequentially scan a file should instead consider using [`ObjectStore::get`],
-/// or [`ObjectStore::get_opts`], or [`ObjectStore::get_range`] to read a particular range.
+/// Systems looking to sequentially scan a file should instead consider using [`ObjectStoreExt::get`],
+/// or [`ObjectStore::get_opts`], or [`ObjectStoreExt::get_range`] to read a particular range.
 ///
 /// Systems looking to read multiple ranges of a file should instead consider using
 /// [`ObjectStore::get_ranges`], which will optimise the vectored IO.
 ///
 /// [high first-byte latencies]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html
+/// [`ObjectStoreExt::get`]: crate::ObjectStoreExt::get
 pub struct BufReader {
     /// The object store to fetch data from
     store: Arc<dyn ObjectStore>,
@@ -210,13 +211,13 @@ impl AsyncBufRead for BufReader {
 
 /// An async buffered writer compatible with the tokio IO traits
 ///
-/// This writer adaptively uses [`ObjectStore::put`] or
-/// [`ObjectStore::put_multipart`] depending on the amount of data that has
+/// This writer adaptively uses [`ObjectStore::put_opts`] or
+/// [`ObjectStore::put_multipart_opts`] depending on the amount of data that has
 /// been written.
 ///
 /// Up to `capacity` bytes will be buffered in memory, and flushed on shutdown
-/// using [`ObjectStore::put`]. If `capacity` is exceeded, data will instead be
-/// streamed using [`ObjectStore::put_multipart`]
+/// using [`ObjectStore::put_opts`]. If `capacity` is exceeded, data will instead be
+/// streamed using [`ObjectStore::put_multipart_opts`].
 pub struct BufWriter {
     capacity: usize,
     max_concurrency: usize,
@@ -238,11 +239,11 @@ impl std::fmt::Debug for BufWriter {
 enum BufWriterState {
     /// Buffer up to capacity bytes
     Buffer(Path, PutPayloadMut),
-    /// [`ObjectStore::put_multipart`]
+    /// [`ObjectStore::put_multipart_opts`]
     Prepare(BoxFuture<'static, crate::Result<WriteMultipart>>),
     /// Write to a multipart upload
     Write(Option<WriteMultipart>),
-    /// [`ObjectStore::put`]
+    /// [`ObjectStore::put_opts`]
     Flush(BoxFuture<'static, crate::Result<()>>),
 }
 
@@ -489,7 +490,7 @@ mod tests {
     use super::*;
     use crate::memory::InMemory;
     use crate::path::Path;
-    use crate::{Attribute, GetOptions};
+    use crate::{Attribute, GetOptions, ObjectStoreExt};
     use itertools::Itertools;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -590,13 +591,7 @@ mod tests {
         writer.write_all(&[0; 5]).await.unwrap();
         writer.shutdown().await.unwrap();
         let response = store
-            .get_opts(
-                &path,
-                GetOptions {
-                    head: true,
-                    ..Default::default()
-                },
-            )
+            .get_opts(&path, GetOptions::new().with_head(true))
             .await
             .unwrap();
         assert_eq!(response.meta.size, 25);
@@ -610,13 +605,7 @@ mod tests {
         writer.write_all(&[0; 20]).await.unwrap();
         writer.shutdown().await.unwrap();
         let response = store
-            .get_opts(
-                &path,
-                GetOptions {
-                    head: true,
-                    ..Default::default()
-                },
-            )
+            .get_opts(&path, GetOptions::new().with_head(true))
             .await
             .unwrap();
         assert_eq!(response.meta.size, 40);
@@ -640,13 +629,7 @@ mod tests {
             .unwrap();
         writer.shutdown().await.unwrap();
         let response = store
-            .get_opts(
-                &path,
-                GetOptions {
-                    head: true,
-                    ..Default::default()
-                },
-            )
+            .get_opts(&path, GetOptions::new().with_head(true))
             .await
             .unwrap();
         assert_eq!(response.meta.size, 25);
@@ -664,13 +647,7 @@ mod tests {
             .unwrap();
         writer.shutdown().await.unwrap();
         let response = store
-            .get_opts(
-                &path,
-                GetOptions {
-                    head: true,
-                    ..Default::default()
-                },
-            )
+            .get_opts(&path, GetOptions::new().with_head(true))
             .await
             .unwrap();
         assert_eq!(response.meta.size, 40);

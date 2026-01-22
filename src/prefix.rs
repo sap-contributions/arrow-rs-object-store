@@ -17,29 +17,30 @@
 
 //! An object store wrapper handling a constant path prefix
 use bytes::Bytes;
-use futures::{stream::BoxStream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use std::ops::Range;
 
+use crate::multipart::{MultipartStore, PartId};
 use crate::path::Path;
 use crate::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 
 /// Store wrapper that applies a constant prefix to all paths handled by the store.
 #[derive(Debug, Clone)]
-pub struct PrefixStore<T: ObjectStore> {
+pub struct PrefixStore<T> {
     prefix: Path,
     inner: T,
 }
 
-impl<T: ObjectStore> std::fmt::Display for PrefixStore<T> {
+impl<T> std::fmt::Display for PrefixStore<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PrefixObjectStore({})", self.prefix.as_ref())
     }
 }
 
-impl<T: ObjectStore> PrefixStore<T> {
+impl<T> PrefixStore<T> {
     /// Create a new instance of [`PrefixStore`]
     pub fn new(store: T, prefix: impl Into<Path>) -> Self {
         Self {
@@ -50,33 +51,28 @@ impl<T: ObjectStore> PrefixStore<T> {
 
     /// Create the full path from a path relative to prefix
     fn full_path(&self, location: &Path) -> Path {
-        self.prefix.parts().chain(location.parts()).collect()
+        full_path(&self.prefix, location)
     }
 
     /// Strip the constant prefix from a given path
     fn strip_prefix(&self, path: Path) -> Path {
-        // Note cannot use match because of borrow checker
-        if let Some(suffix) = path.prefix_match(&self.prefix) {
-            return suffix.collect();
-        }
-        path
+        strip_prefix(&self.prefix, path)
     }
 
     /// Strip the constant prefix from a given ObjectMeta
     fn strip_meta(&self, meta: ObjectMeta) -> ObjectMeta {
-        ObjectMeta {
-            last_modified: meta.last_modified,
-            size: meta.size,
-            location: self.strip_prefix(meta.location),
-            e_tag: meta.e_tag,
-            version: None,
-        }
+        strip_meta(&self.prefix, meta)
     }
 }
 
-// Note: This is a relative hack to move these two functions to pure functions so they don't rely
-// on the `self` lifetime. Expected to be cleaned up before merge.
-//
+// Note: This is a relative hack to move these functions to pure functions so they don't rely
+// on the `self` lifetime.
+
+/// Create the full path from a path relative to prefix
+fn full_path(prefix: &Path, path: &Path) -> Path {
+    prefix.parts().chain(path.parts()).collect()
+}
+
 /// Strip the constant prefix from a given path
 fn strip_prefix(prefix: &Path, path: Path) -> Path {
     // Note cannot use match because of borrow checker
@@ -96,13 +92,10 @@ fn strip_meta(prefix: &Path, meta: ObjectMeta) -> ObjectMeta {
         version: None,
     }
 }
-#[async_trait::async_trait]
-impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
-    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-        let full_path = self.full_path(location);
-        self.inner.put(&full_path, payload).await
-    }
 
+#[async_trait::async_trait]
+#[deny(clippy::missing_trait_methods)]
+impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
     async fn put_opts(
         &self,
         location: &Path,
@@ -113,11 +106,6 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
         self.inner.put_opts(&full_path, payload, opts).await
     }
 
-    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-        let full_path = self.full_path(location);
-        self.inner.put_multipart(&full_path).await
-    }
-
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -125,16 +113,6 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
     ) -> Result<Box<dyn MultipartUpload>> {
         let full_path = self.full_path(location);
         self.inner.put_multipart_opts(&full_path, opts).await
-    }
-
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        let full_path = self.full_path(location);
-        self.inner.get(&full_path).await
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        let full_path = self.full_path(location);
-        self.inner.get_range(&full_path, range).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -147,15 +125,19 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
         self.inner.get_ranges(&full_path, ranges).await
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let full_path = self.full_path(location);
-        let meta = self.inner.head(&full_path).await?;
-        Ok(self.strip_meta(meta))
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let full_path = self.full_path(location);
-        self.inner.delete(&full_path).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let prefix = self.prefix.clone();
+        let locations = locations
+            .map(move |location| location.map(|loc| full_path(&prefix, &loc)))
+            .boxed();
+        let prefix = self.prefix.clone();
+        self.inner
+            .delete_stream(locations)
+            .map(move |location| location.map(|loc| strip_prefix(&prefix, loc)))
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -196,28 +178,50 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
             })
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         let full_from = self.full_path(from);
         let full_to = self.full_path(to);
-        self.inner.copy(&full_from, &full_to).await
+        self.inner.copy_opts(&full_from, &full_to, options).await
     }
 
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
         let full_from = self.full_path(from);
         let full_to = self.full_path(to);
-        self.inner.rename(&full_from, &full_to).await
+        self.inner.rename_opts(&full_from, &full_to, options).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: MultipartStore> MultipartStore for PrefixStore<T> {
+    async fn create_multipart(&self, path: &Path) -> Result<MultipartId> {
+        let full_path = self.full_path(path);
+        self.inner.create_multipart(&full_path).await
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let full_from = self.full_path(from);
-        let full_to = self.full_path(to);
-        self.inner.copy_if_not_exists(&full_from, &full_to).await
+    async fn put_part(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        part_idx: usize,
+        data: PutPayload,
+    ) -> Result<PartId> {
+        let full_path = self.full_path(path);
+        self.inner.put_part(&full_path, id, part_idx, data).await
     }
 
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let full_from = self.full_path(from);
-        let full_to = self.full_path(to);
-        self.inner.rename_if_not_exists(&full_from, &full_to).await
+    async fn complete_multipart(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        parts: Vec<PartId>,
+    ) -> Result<PutResult> {
+        let full_path = self.full_path(path);
+        self.inner.complete_multipart(&full_path, id, parts).await
+    }
+
+    async fn abort_multipart(&self, path: &Path, id: &MultipartId) -> Result<()> {
+        let full_path = self.full_path(path);
+        self.inner.abort_multipart(&full_path, id).await
     }
 }
 
@@ -227,8 +231,9 @@ mod tests {
     use std::slice;
 
     use super::*;
-    use crate::integration::*;
     use crate::local::LocalFileSystem;
+    use crate::memory::InMemory;
+    use crate::{ObjectStoreExt, integration::*};
 
     use tempfile::TempDir;
 
@@ -292,5 +297,14 @@ mod tests {
         let location = Path::from("prefix/test_written.json");
         let read_data = local.get(&location).await.unwrap().bytes().await.unwrap();
         assert_eq!(&*read_data, data)
+    }
+
+    #[tokio::test]
+    async fn prefix_multipart() {
+        let store = PrefixStore::new(InMemory::new(), "prefix");
+
+        multipart(&store, &store).await;
+        multipart_out_of_order(&store).await;
+        multipart_race_condition(&store, true).await;
     }
 }

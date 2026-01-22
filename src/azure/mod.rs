@@ -19,15 +19,16 @@
 //!
 //! ## Streaming uploads
 //!
-//! [ObjectStore::put_multipart] will upload data in blocks and write a blob from those blocks.
+//! [`ObjectStore::put_multipart_opts`] will upload data in blocks and write a blob from those blocks.
 //!
 //! Unused blocks will automatically be dropped after 7 days.
 use crate::{
+    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    UploadPart,
     multipart::{MultipartStore, PartId},
     path::Path,
     signer::Signer,
-    GetOptions, GetResult, ListResult, MultipartId, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UploadPart,
 };
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
@@ -37,10 +38,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
+use crate::client::CredentialProvider;
 use crate::client::get::GetClientExt;
 use crate::client::list::{ListClient, ListClientExt};
-use crate::client::CredentialProvider;
-pub use credential::{authority_hosts, AzureAccessKey, AzureAuthorizer};
+pub use credential::{AzureAccessKey, AzureAuthorizer, authority_hosts};
 
 mod builder;
 mod client;
@@ -116,27 +117,28 @@ impl ObjectStore for MicrosoftAzure {
         self.client.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.client.delete_request(location, &()).await
-    }
-
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.client.list(prefix)
     }
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<'a, Result<Path>> {
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let client = Arc::clone(&self.client);
         locations
             .try_chunks(256)
-            .map(move |locations| async {
-                // Early return the error. We ignore the paths that have already been
-                // collected into the chunk.
-                let locations = locations.map_err(|e| e.1)?;
-                self.client
-                    .bulk_delete_request(locations)
-                    .await
-                    .map(futures::stream::iter)
+            .map(move |locations| {
+                let client = Arc::clone(&client);
+                async move {
+                    // Early return the error. We ignore the paths that have already been
+                    // collected into the chunk.
+                    let locations = locations.map_err(|e| e.1)?;
+                    client
+                        .bulk_delete_request(locations)
+                        .await
+                        .map(futures::stream::iter)
+                }
             })
             .buffered(20)
             .try_flatten()
@@ -147,12 +149,16 @@ impl ObjectStore for MicrosoftAzure {
         self.client.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        self.client.copy_request(from, to, true).await
-    }
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        let CopyOptions {
+            mode,
+            extensions: _,
+        } = options;
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.client.copy_request(from, to, false).await
+        match mode {
+            CopyMode::Overwrite => self.client.copy_request(from, to, true).await,
+            CopyMode::Create => self.client.copy_request(from, to, false).await,
+        }
     }
 }
 
@@ -307,6 +313,7 @@ impl PaginatedListStore for MicrosoftAzure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObjectStoreExt;
     use crate::integration::*;
     use crate::tests::*;
     use bytes::Bytes;

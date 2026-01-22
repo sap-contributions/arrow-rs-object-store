@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client::{http_connector, HttpConnector, TokenCredentialProvider};
+use crate::client::{HttpConnector, TokenCredentialProvider, http_connector};
 use crate::config::ConfigValue;
 use crate::gcp::client::{GoogleCloudStorageClient, GoogleCloudStorageConfig};
 use crate::gcp::credential::{
-    ApplicationDefaultCredentials, InstanceCredentialProvider, ServiceAccountCredentials,
-    DEFAULT_GCS_BASE_URL,
+    ApplicationDefaultCredentials, DEFAULT_GCS_BASE_URL, InstanceCredentialProvider,
+    ServiceAccountCredentials,
 };
 use crate::gcp::{
-    credential, GcpCredential, GcpCredentialProvider, GcpSigningCredential,
-    GcpSigningCredentialProvider, GoogleCloudStorage, STORE,
+    GcpCredential, GcpCredentialProvider, GcpSigningCredential, GcpSigningCredentialProvider,
+    GoogleCloudStorage, STORE, credential,
 };
 use crate::{ClientConfigKey, ClientOptions, Result, RetryConfig, StaticCredentialProvider};
 use serde::{Deserialize, Serialize};
@@ -98,6 +98,8 @@ pub struct GoogleCloudStorageBuilder {
     bucket_name: Option<String>,
     /// Url
     url: Option<String>,
+    /// Base URL
+    base_url: Option<String>,
     /// Path to the service account file
     service_account_path: Option<String>,
     /// The serialized service account key
@@ -159,12 +161,29 @@ pub enum GoogleConfigKey {
     /// - `bucket_name`
     Bucket,
 
+    /// Base URL
+    ///
+    /// See [`GoogleCloudStorageBuilder::with_base_url`] for details.
+    ///
+    /// Supported keys:
+    /// - `google_base_url`
+    /// - `base_url`
+    BaseUrl,
+
     /// Application credentials path
     ///
     /// See [`GoogleCloudStorageBuilder::with_application_credentials`].
+    ///
+    /// Supported keys:
+    /// - `google_application_credentials`
+    /// - `application_credentials`
     ApplicationCredentials,
 
     /// Skip signing request
+    ///
+    /// Supported keys:
+    /// - `google_skip_signature`
+    /// - `skip_signature`
     SkipSignature,
 
     /// Client options
@@ -177,6 +196,7 @@ impl AsRef<str> for GoogleConfigKey {
             Self::ServiceAccount => "google_service_account",
             Self::ServiceAccountKey => "google_service_account_key",
             Self::Bucket => "google_bucket",
+            Self::BaseUrl => "google_base_url",
             Self::ApplicationCredentials => "google_application_credentials",
             Self::SkipSignature => "google_skip_signature",
             Self::Client(key) => key.as_ref(),
@@ -195,6 +215,7 @@ impl FromStr for GoogleConfigKey {
             | "service_account_path" => Ok(Self::ServiceAccount),
             "google_service_account_key" | "service_account_key" => Ok(Self::ServiceAccountKey),
             "google_bucket" | "google_bucket_name" | "bucket" | "bucket_name" => Ok(Self::Bucket),
+            "google_base_url" | "base_url" => Ok(Self::BaseUrl),
             "google_application_credentials" | "application_credentials" => {
                 Ok(Self::ApplicationCredentials)
             }
@@ -217,6 +238,7 @@ impl Default for GoogleCloudStorageBuilder {
             retry_config: Default::default(),
             client_options: ClientOptions::new().with_allow_http(true),
             url: None,
+            base_url: None,
             credentials: None,
             skip_signature: Default::default(),
             signing_credentials: None,
@@ -296,6 +318,7 @@ impl GoogleCloudStorageBuilder {
             GoogleConfigKey::ServiceAccount => self.service_account_path = Some(value.into()),
             GoogleConfigKey::ServiceAccountKey => self.service_account_key = Some(value.into()),
             GoogleConfigKey::Bucket => self.bucket_name = Some(value.into()),
+            GoogleConfigKey::BaseUrl => self.base_url = Some(value.into()),
             GoogleConfigKey::ApplicationCredentials => {
                 self.application_credentials_path = Some(value.into())
             }
@@ -323,6 +346,7 @@ impl GoogleCloudStorageBuilder {
             GoogleConfigKey::ServiceAccount => self.service_account_path.clone(),
             GoogleConfigKey::ServiceAccountKey => self.service_account_key.clone(),
             GoogleConfigKey::Bucket => self.bucket_name.clone(),
+            GoogleConfigKey::BaseUrl => self.base_url.clone(),
             GoogleConfigKey::ApplicationCredentials => self.application_credentials_path.clone(),
             GoogleConfigKey::SkipSignature => Some(self.skip_signature.to_string()),
             GoogleConfigKey::Client(key) => self.client_options.get_config_value(key),
@@ -356,6 +380,25 @@ impl GoogleCloudStorageBuilder {
     /// Set the bucket name (required)
     pub fn with_bucket_name(mut self, bucket_name: impl Into<String>) -> Self {
         self.bucket_name = Some(bucket_name.into());
+        self
+    }
+
+    /// Sets the base URL for communicating with GCS.
+    ///
+    /// If not explicitly set, it will be:
+    /// 1. Derived from the service account credentials, if provided
+    /// 2. Otherwise, uses the default GCS endpoint
+    ///
+    /// # Example
+    /// ```
+    /// use object_store::gcp::GoogleCloudStorageBuilder;
+    ///
+    /// let gcs = GoogleCloudStorageBuilder::from_env()
+    ///     .with_base_url("https://localhost:4443")
+    ///     .build();
+    /// ```
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        self.base_url = Some(base_url.into());
         self
     }
 
@@ -483,17 +526,28 @@ impl GoogleCloudStorageBuilder {
             };
 
         // Then try to initialize from the application credentials file, or the environment.
+        // Only attempt to read ADC if no explicit credentials were provided
         let application_default_credentials =
-            ApplicationDefaultCredentials::read(self.application_credentials_path.as_deref())?;
+            if service_account_credentials.is_none() && self.credentials.is_none() {
+                // No explicit credentials, so try ADC and propagate errors
+                ApplicationDefaultCredentials::read(self.application_credentials_path.as_deref())?
+            } else {
+                // Explicit credentials provided, skip ADC reading entirely
+                None
+            };
 
         let disable_oauth = service_account_credentials
             .as_ref()
             .map(|c| c.disable_oauth)
             .unwrap_or(false);
 
-        let gcs_base_url: String = service_account_credentials
-            .as_ref()
-            .and_then(|c| c.gcs_base_url.clone())
+        let gcs_base_url: String = self
+            .base_url
+            .or_else(|| {
+                service_account_credentials
+                    .as_ref()
+                    .and_then(|c| c.gcs_base_url.clone())
+            })
             .unwrap_or_else(|| DEFAULT_GCS_BASE_URL.to_string());
 
         let credentials = if let Some(credentials) = self.credentials {
@@ -592,6 +646,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     const FAKE_KEY: &str = r#"{"private_key": "private_key", "private_key_id": "private_key_id", "client_email":"client_email", "disable_oauth":true}"#;
+    const FAKE_KEY_WITH_BASE_URL: &str = r#"{"private_key": "private_key", "private_key_id": "private_key_id", "client_email":"client_email", "disable_oauth":true, "gcs_base_url": "https://base-url-from-credentials:4443"}"#;
 
     #[test]
     fn gcs_test_service_account_key_and_path() {
@@ -707,6 +762,46 @@ mod tests {
     }
 
     #[test]
+    fn gcs_test_with_base_url() {
+        let no_base_url = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("foo")
+            .build()
+            .unwrap();
+        assert_eq!(no_base_url.client.config().base_url, DEFAULT_GCS_BASE_URL);
+
+        let explicit_override = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("foo")
+            .with_base_url("https://explicitly-overriden:4443")
+            .build()
+            .unwrap();
+        assert_eq!(
+            explicit_override.client.config().base_url,
+            "https://explicitly-overriden:4443"
+        );
+
+        let url_in_credentials = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("foo")
+            .with_service_account_key(FAKE_KEY_WITH_BASE_URL)
+            .build()
+            .unwrap();
+        assert_eq!(
+            url_in_credentials.client.config().base_url,
+            "https://base-url-from-credentials:4443"
+        );
+
+        let explicit_override_and_credentials = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("foo")
+            .with_base_url("https://explicitly-overriden:4443") // this should take precedence
+            .with_service_account_key(FAKE_KEY_WITH_BASE_URL)
+            .build()
+            .unwrap();
+        assert_eq!(
+            explicit_override_and_credentials.client.config().base_url,
+            "https://explicitly-overriden:4443"
+        );
+    }
+
+    #[test]
     fn gcs_test_config_get_value() {
         let google_service_account = "object_store:fake_service_account".to_string();
         let google_bucket_name = "object_store:fake_bucket".to_string();
@@ -737,5 +832,113 @@ mod tests {
         } else {
             panic!("{key} not propagated as ClientConfigKey");
         }
+    }
+
+    #[test]
+    fn gcs_test_explicit_creds_skip_invalid_adc() {
+        // Create a valid service account key file
+        let mut valid_key_file = NamedTempFile::new().unwrap();
+        write!(valid_key_file, "{FAKE_KEY}").unwrap();
+
+        // Create invalid ADC file with unsupported credential type
+        let mut invalid_adc_file = NamedTempFile::new().unwrap();
+        invalid_adc_file
+            .write_all(br#"{"type": "external_account_authorized_user", "audience": "test"}"#)
+            .unwrap();
+
+        // Build should succeed because explicit credentials are provided
+        // and ADC errors should be ignored
+        let result = GoogleCloudStorageBuilder::new()
+            .with_service_account_path(valid_key_file.path().to_str().unwrap())
+            .with_application_credentials(invalid_adc_file.path().to_str().unwrap())
+            .with_bucket_name("test-bucket")
+            .build();
+
+        // Should succeed - ADC errors should be ignored when explicit creds provided
+        assert!(
+            result.is_ok(),
+            "Build should succeed with explicit credentials despite invalid ADC: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn gcs_test_explicit_creds_with_service_account_key_skip_invalid_adc() {
+        // Create invalid ADC file with unsupported credential type
+        let mut invalid_adc_file = NamedTempFile::new().unwrap();
+        invalid_adc_file
+            .write_all(br#"{"type": "external_account_authorized_user", "audience": "test"}"#)
+            .unwrap();
+
+        // Build should succeed with service account key (not path)
+        let result = GoogleCloudStorageBuilder::new()
+            .with_service_account_key(FAKE_KEY)
+            .with_application_credentials(invalid_adc_file.path().to_str().unwrap())
+            .with_bucket_name("test-bucket")
+            .build();
+
+        // Should succeed - ADC errors should be ignored when explicit creds provided
+        assert!(
+            result.is_ok(),
+            "Build should succeed with service account key despite invalid ADC: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn gcs_test_adc_error_propagated_without_explicit_creds() {
+        // Create invalid ADC file with unsupported credential type
+        let mut invalid_adc_file = NamedTempFile::new().unwrap();
+        invalid_adc_file
+            .write_all(br#"{"type": "external_account_authorized_user", "audience": "test"}"#)
+            .unwrap();
+
+        // Build should fail because no explicit credentials and ADC is invalid
+        let result = GoogleCloudStorageBuilder::new()
+            .with_application_credentials(invalid_adc_file.path().to_str().unwrap())
+            .with_bucket_name("test-bucket")
+            .build();
+
+        // Should fail - ADC errors should be propagated when no explicit creds
+        assert!(
+            result.is_err(),
+            "Build should fail without explicit credentials and invalid ADC"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("external_account_authorized_user"),
+            "Error should mention unsupported credential type: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn gcs_test_with_credentials_skip_invalid_adc() {
+        use crate::StaticCredentialProvider;
+
+        // Create invalid ADC file with unsupported credential type
+        let mut invalid_adc_file = NamedTempFile::new().unwrap();
+        invalid_adc_file
+            .write_all(br#"{"type": "external_account_authorized_user", "audience": "test"}"#)
+            .unwrap();
+
+        // Create a custom credential provider
+        let custom_creds = Arc::new(StaticCredentialProvider::new(GcpCredential {
+            bearer: "custom-token".to_string(),
+        }));
+
+        // Build should succeed with custom credentials provider despite invalid ADC
+        let result = GoogleCloudStorageBuilder::new()
+            .with_credentials(custom_creds)
+            .with_application_credentials(invalid_adc_file.path().to_str().unwrap())
+            .with_bucket_name("test-bucket")
+            .build();
+
+        // Should succeed - ADC errors should be ignored when explicit creds provided via with_credentials
+        assert!(
+            result.is_ok(),
+            "Build should succeed with custom credentials despite invalid ADC: {:?}",
+            result.err()
+        );
     }
 }

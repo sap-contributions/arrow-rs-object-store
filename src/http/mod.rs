@@ -41,13 +41,13 @@ use url::Url;
 
 use crate::client::get::GetClientExt;
 use crate::client::header::get_etag;
-use crate::client::{http_connector, HttpConnector};
+use crate::client::{HttpConnector, http_connector};
 use crate::http::client::Client;
 use crate::path::Path;
 use crate::{
-    ClientConfigKey, ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    RetryConfig,
+    ClientConfigKey, ClientOptions, CopyMode, CopyOptions, GetOptions, GetResult, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result, RetryConfig,
 };
 
 mod client;
@@ -104,7 +104,10 @@ impl ObjectStore for HttpStore {
     ) -> Result<PutResult> {
         if opts.mode != PutMode::Overwrite {
             // TODO: Add support for If header - https://datatracker.ietf.org/doc/html/rfc2518#section-9.4
-            return Err(crate::Error::NotImplemented);
+            return Err(crate::Error::NotImplemented {
+                operation: "`put_opts` with a mode other than `PutMode::Overwrite`".into(),
+                implementer: self.to_string(),
+            });
         }
 
         let response = self.client.put(location, payload, opts.attributes).await?;
@@ -125,15 +128,32 @@ impl ObjectStore for HttpStore {
         _location: &Path,
         _opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        Err(crate::Error::NotImplemented)
+        Err(crate::Error::NotImplemented {
+            operation: "`put_multipart_opts`".into(),
+            implementer: self.to_string(),
+        })
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         self.client.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.client.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let client = Arc::clone(&self.client);
+        locations
+            .map(move |location| {
+                let client = Arc::clone(&client);
+                async move {
+                    let location = location?;
+                    client.delete(&location).await?;
+                    Ok(location)
+                }
+            })
+            .buffered(10)
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -192,12 +212,16 @@ impl ObjectStore for HttpStore {
         })
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        self.client.copy(from, to, true).await
-    }
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        let CopyOptions {
+            mode,
+            extensions: _,
+        } = options;
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.client.copy(from, to, false).await
+        match mode {
+            CopyMode::Overwrite => self.client.copy(from, to, true).await,
+            CopyMode::Create => self.client.copy(from, to, false).await,
+        }
     }
 }
 

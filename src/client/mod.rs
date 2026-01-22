@@ -64,7 +64,7 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use reqwest::{NoProxy, Proxy};
 
-use crate::config::{fmt_duration, ConfigValue};
+use crate::config::{ConfigValue, fmt_duration};
 use crate::path::Path;
 use crate::{GetOptions, Result};
 
@@ -82,55 +82,113 @@ static DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CAR
 #[non_exhaustive]
 pub enum ClientConfigKey {
     /// Allow non-TLS, i.e. non-HTTPS connections
+    ///
+    /// Supported keys:
+    /// - `allow_http`
     AllowHttp,
     /// Skip certificate validation on https connections.
     ///
-    /// # Warning
+    /// <div class="warning">
+    ///
+    /// **Warning**
     ///
     /// You should think very carefully before using this method. If
     /// invalid certificates are trusted, *any* certificate for *any* site
     /// will be trusted for use. This includes expired certificates. This
     /// introduces significant vulnerabilities, and should only be used
     /// as a last resort or for testing
+    ///
+    /// </div>
+    ///
+    /// Supported keys:
+    /// - `allow_invalid_certificates`
     AllowInvalidCertificates,
     /// Timeout for only the connect phase of a Client
+    ///
+    /// Supported keys:
+    /// - `connect_timeout`
     ConnectTimeout,
-    /// default CONTENT_TYPE for uploads
+    /// default [`Content-Type`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Type) for uploads
+    ///
+    /// Supported keys:
+    /// - `default_content_type`
     DefaultContentType,
-    /// Only use http1 connections
+    /// Only use HTTP/1 connections
+    ///
+    /// Supported keys:
+    /// - `http1_only`
     Http1Only,
-    /// Interval for HTTP2 Ping frames should be sent to keep a connection alive.
+    /// Interval for HTTP/2 Ping frames should be sent to keep a connection alive.
+    ///
+    /// Supported keys:
+    /// - `http2_keep_alive_interval`
     Http2KeepAliveInterval,
     /// Timeout for receiving an acknowledgement of the keep-alive ping.
+    ///
+    /// Supported keys:
+    /// - `http2_keep_alive_timeout`
     Http2KeepAliveTimeout,
-    /// Enable HTTP2 keep alive pings for idle connections
+    /// Enable HTTP/2 keep alive pings for idle connections
+    ///
+    /// Supported keys:
+    /// - `http2_keep_alive_while_idle`
     Http2KeepAliveWhileIdle,
-    /// Sets the maximum frame size to use for HTTP2.
+    /// Sets the maximum frame size to use for HTTP/2.
+    ///
+    /// Supported keys:
+    /// - `http2_max_frame_size`
     Http2MaxFrameSize,
-    /// Only use http2 connections
+    /// Only use HTTP/2 connections
+    ///
+    /// Supported keys:
+    /// - `http2_only`
     Http2Only,
     /// The pool max idle timeout
     ///
     /// This is the length of time an idle connection will be kept alive
+    ///
+    /// Supported keys:
+    /// - `pool_idle_timeout`
     PoolIdleTimeout,
     /// maximum number of idle connections per host
+    ///
+    /// Supported keys:
+    /// - `pool_max_idle_per_host`
     PoolMaxIdlePerHost,
     /// HTTP proxy to use for requests
+    ///
+    /// Supported keys:
+    /// - `proxy_url`
     ProxyUrl,
     /// PEM-formatted CA certificate for proxy connections
+    ///
+    /// Supported keys:
+    /// - `proxy_ca_certificate`
     ProxyCaCertificate,
     /// List of hosts that bypass proxy
+    ///
+    /// Supported keys:
+    /// - `proxy_excludes`
     ProxyExcludes,
     /// Randomize order addresses that the DNS resolution yields.
     ///
     /// This will spread the connections across more servers.
+    ///
+    /// Supported keys:
+    /// - `randomize_addresses`
     RandomizeAddresses,
     /// Request timeout
     ///
     /// The timeout is applied from when the request starts connecting until the
     /// response body has finished
+    ///
+    /// Supported keys:
+    /// - `timeout`
     Timeout,
     /// User-Agent header to be used by this client
+    ///
+    /// Supported keys:
+    /// - `user_agent`
     UserAgent,
 }
 
@@ -297,8 +355,8 @@ impl Default for ClientOptions {
             http2_keep_alive_timeout: None,
             http2_keep_alive_while_idle: Default::default(),
             http2_max_frame_size: None,
-            // HTTP2 is known to be significantly slower than HTTP1, so we default
-            // to HTTP1 for now.
+            // HTTP/2 is known to be significantly slower than HTTP/1, so we default
+            // to HTTP/1 for now.
             // https://github.com/apache/arrow-rs/issues/5194
             http1_only: true.into(),
             http2_only: Default::default(),
@@ -394,7 +452,7 @@ impl ClientOptions {
         }
     }
 
-    /// Sets the User-Agent header to be used by this client
+    /// Sets the [`User-Agent`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/User-Agent) header to be used by this client
     ///
     /// Default is based on the version of this crate
     pub fn with_user_agent(mut self, agent: HeaderValue) -> Self {
@@ -412,13 +470,13 @@ impl ClientOptions {
         self
     }
 
-    /// Set the default CONTENT_TYPE for uploads
+    /// Set the default [`Content-Type`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Type) for uploads
     pub fn with_default_content_type(mut self, mime: impl Into<String>) -> Self {
         self.default_content_type = Some(mime.into());
         self
     }
 
-    /// Set the CONTENT_TYPE for a given file extension
+    /// Set the [`Content-Type`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Type) for a given file extension
     pub fn with_content_type_for_suffix(
         mut self,
         extension: impl Into<String>,
@@ -434,46 +492,76 @@ impl ClientOptions {
         self
     }
 
-    /// Sets what protocol is allowed. If `allow_http` is :
-    /// * false (default):  Only HTTPS are allowed
-    /// * true:  HTTP and HTTPS are allowed
+    /// Sets what protocol is allowed.
+    ///
+    /// If `allow_http` is :
+    /// * `false` (default):  Only HTTPS is allowed
+    /// * `true`:  HTTP and HTTPS are allowed
     pub fn with_allow_http(mut self, allow_http: bool) -> Self {
         self.allow_http = allow_http.into();
         self
     }
     /// Allows connections to invalid SSL certificates
-    /// * false (default):  Only valid HTTPS certificates are allowed
-    /// * true:  All HTTPS certificates are allowed
     ///
-    /// # Warning
+    /// If `allow_invalid_certificates` is :
+    /// * `false` (default):  Only valid HTTPS certificates are allowed
+    /// * `true`:  All HTTPS certificates are allowed
+    ///
+    /// <div class="warning">
+    ///
+    /// **Warning**
     ///
     /// You should think very carefully before using this method. If
     /// invalid certificates are trusted, *any* certificate for *any* site
     /// will be trusted for use. This includes expired certificates. This
     /// introduces significant vulnerabilities, and should only be used
     /// as a last resort or for testing
+    ///
+    /// </div>
     pub fn with_allow_invalid_certificates(mut self, allow_insecure: bool) -> Self {
         self.allow_insecure = allow_insecure.into();
         self
     }
 
-    /// Only use http1 connections
+    /// Only use HTTP/1 connections (default)
     ///
-    /// This is on by default, since http2 is known to be significantly slower than http1.
+    /// # See Also
+    /// * [`Self::with_http2_only`] if you only want to use HTTP/2
+    /// * [`Self::with_allow_http2`] if you want to use HTTP/1 or HTTP/2
+    ///
+    /// <div class="warning">
+    /// HTTP/2 is not used by default. See details [#104](https://github.com/apache/arrow-rs-object-store/issues/104)
+    /// </div>
     pub fn with_http1_only(mut self) -> Self {
         self.http2_only = false.into();
         self.http1_only = true.into();
         self
     }
 
-    /// Only use http2 connections
+    /// Only use HTTP/2 connections
+    ///
+    /// # See Also
+    /// * [`Self::with_http1_only`] if you only want to use HTTP/1
+    /// * [`Self::with_allow_http2`] if you want to use HTTP/1 or HTTP/2
+    ///
+    /// <div class="warning">
+    /// HTTP/2 is not used by default. See details [#104](https://github.com/apache/arrow-rs-object-store/issues/104)
+    /// </div>
     pub fn with_http2_only(mut self) -> Self {
         self.http1_only = false.into();
         self.http2_only = true.into();
         self
     }
 
-    /// Use http2 if supported, otherwise use http1.
+    /// Use HTTP/2 if supported, otherwise use HTTP/1.
+    ///
+    /// # See Also
+    /// * [`Self::with_http1_only`] if you only want to use HTTP/1
+    /// * [`Self::with_http2_only`] if you only want to use HTTP/2
+    ///
+    /// <div class="warning">
+    /// HTTP/2 is not used by default. See details [#104](https://github.com/apache/arrow-rs-object-store/issues/104)
+    /// </div>
     pub fn with_allow_http2(mut self) -> Self {
         self.http1_only = false.into();
         self.http2_only = false.into();
@@ -574,7 +662,7 @@ impl ClientOptions {
         self
     }
 
-    /// Sets an interval for HTTP2 Ping frames should be sent to keep a connection alive.
+    /// Sets an interval for HTTP/2 Ping frames should be sent to keep a connection alive.
     ///
     /// Default is disabled enforced by reqwest
     pub fn with_http2_keep_alive_interval(mut self, interval: Duration) -> Self {
@@ -585,7 +673,7 @@ impl ClientOptions {
     /// Sets a timeout for receiving an acknowledgement of the keep-alive ping.
     ///
     /// If the ping is not acknowledged within the timeout, the connection will be closed.
-    /// Does nothing if http2_keep_alive_interval is disabled.
+    /// Does nothing if `http2_keep_alive_interval` is disabled.
     ///
     /// Default is disabled enforced by reqwest
     pub fn with_http2_keep_alive_timeout(mut self, interval: Duration) -> Self {
@@ -593,7 +681,7 @@ impl ClientOptions {
         self
     }
 
-    /// Enable HTTP2 keep alive pings for idle connections
+    /// Enable HTTP/2 keep alive pings for idle connections
     ///
     /// If disabled, keep-alive pings are only sent while there are open request/response
     /// streams. If enabled, pings are also sent when no streams are active
@@ -604,7 +692,7 @@ impl ClientOptions {
         self
     }
 
-    /// Sets the maximum frame size to use for HTTP2.
+    /// Sets the maximum frame size to use for HTTP/2.
     ///
     /// Default is currently 16,384 but may change internally to optimize for common uses.
     pub fn with_http2_max_frame_size(mut self, sz: u32) -> Self {
@@ -841,8 +929,8 @@ where
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 mod cloud {
     use super::*;
-    use crate::client::token::{TemporaryToken, TokenCache};
     use crate::RetryConfig;
+    use crate::client::token::{TemporaryToken, TokenCache};
 
     /// A [`CredentialProvider`] that uses [`HttpClient`] to fetch temporary tokens
     #[derive(Debug)]
