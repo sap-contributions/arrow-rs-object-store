@@ -15,18 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::client::HttpResponseBody;
 use crate::client::builder::HttpRequestBuilder;
 use crate::client::retry::RetryExt;
-use crate::client::HttpResponseBody;
 use crate::path::Path;
 use chrono::{TimeZone, Utc};
-use hyper::{header::HeaderValue, StatusCode};
+use hyper::{StatusCode, header::HeaderValue};
 use url::Url;
 
-use hyper::{header::CONTENT_LENGTH, header::CONTENT_RANGE, Method};
+use hyper::{Method, header::CONTENT_LENGTH, header::CONTENT_RANGE};
 
-use crate::client::HttpClient;
 use crate::PutPayload;
+use crate::client::HttpClient;
 use crate::{GetRange, PutMode, PutMultipartOptions, PutOptions, PutResult};
 use crate::{ListResult, ObjectMeta};
 
@@ -36,15 +36,16 @@ use crate::client::HttpResponse;
 use serde::Serialize;
 use std::sync::Arc;
 
+use crate::GetOptions;
 use crate::client::get::GetClient;
 use crate::client::list::ListClient;
 use crate::hdlfs::filestatus::FileStatusResponse;
 use crate::hdlfs::list::{
-    BatchDeleteWrapper, DeleteFile, DirectoryListing, MergeSource, MergeSourcesWrapper, NonRecursiveDirectoryListing,
+    BatchDeleteWrapper, DeleteFile, DirectoryListing, MergeSource, MergeSourcesWrapper,
+    NonRecursiveDirectoryListing,
 };
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
-use crate::GetOptions;
 use async_trait::async_trait;
 
 macro_rules! trace_log {

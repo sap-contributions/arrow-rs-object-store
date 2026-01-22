@@ -17,20 +17,22 @@
 
 //! An object store implementation for SAP HANA Cloud, Data Lake Files (hdlfs)
 
+use crate::CopyOptions;
 use crate::client::get::GetClientExt;
 use crate::client::list::ListClientExt;
 use crate::client::parts::Parts;
 use crate::hdlfs::client::SAPHdlfsClient;
 use crate::multipart::{MultipartStore, PartId};
 use crate::{
-    path::Path, GetOptions, GetRange, GetResult, ListResult, MultipartId, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    UploadPart,
+    GetOptions, GetRange, GetResult, ListResult, MultipartId, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UploadPart,
+    path::Path,
 };
 use async_trait::async_trait;
 pub use builder::SAPHdlfsBuilder;
 pub use builder::SAPHdlfsConfigKey;
 pub use credential::SAPHdlfsCredential;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use std::fmt;
 use std::fmt::Debug;
@@ -130,19 +132,6 @@ impl ObjectStore for SAPHdlfs {
         result
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let start = std::time::Instant::now();
-        let result = self.client.delete_request(location, &()).await;
-        let duration = start.elapsed();
-        trace_api_call!(
-            self,
-            "<< delete end, path: {}, took: {} ms",
-            location,
-            duration.as_millis()
-        );
-        result
-    }
-
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let prefix_str = prefix.map(|p| p.to_string()).unwrap_or_default();
         trace_api_call!(self, ">> list start, prefix: {}", prefix_str);
@@ -164,32 +153,35 @@ impl ObjectStore for SAPHdlfs {
         result
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
         let start = std::time::Instant::now();
-        let result = self.client.copy_request(from, to, true).await;
         let duration = start.elapsed();
-        trace_api_call!(
-            self,
-            "<< copy end, from: {}, to: {}, took: {} ms",
-            from,
-            to,
-            duration.as_millis()
-        );
-        result
+        // NOTE: Must be outside to be clone with 'static lifetime inside the stream
+        let client = Arc::clone(&self.client);
+        locations
+            .map(move |location| {
+                let client = client.clone();
+                async move {
+                    let location = location?;
+                    client.delete_request(&location, &()).await?;
+                    trace_api_call!(
+                        client,
+                        "<< delete_stream end, path: {}, took: {} ms",
+                        location,
+                        duration.as_millis()
+                    );
+                    Ok(location)
+                }
+            })
+            .buffered(10)
+            .boxed()
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let start = std::time::Instant::now();
-        let result = self.client.copy_request(from, to, false).await;
-        let duration = start.elapsed();
-        trace_api_call!(
-            self,
-            "<< copy_if_not_exists end, from: {}, to: {}, took: {} ms",
-            from,
-            to,
-            duration.as_millis()
-        );
-        result
+    async fn copy_opts(&self, _from: &Path, _to: &Path, _options: CopyOptions) -> Result<()> {
+        unimplemented!("SAPHdlfs does not support copy_opts operation");
     }
 }
 
