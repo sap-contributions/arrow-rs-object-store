@@ -66,6 +66,7 @@ const HDLFS_JSON: &str = "application/json";
 const LIST_DLT_SUFFIX1: &str = "__list_delta_table_1__/";
 const LIST_DLT_SUFFIX2: &str = "__list_delta_table_2__/";
 const LIST_FILES_SUFFIX3: &str = "__list_files_recursive__/";
+const DELETE_FILES_RECURSIVE_SUFFIX: &str = "__delete_files_recursive__";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -428,13 +429,34 @@ impl SAPHdlfsClient {
         location: &crate::path::Path,
         _unused: &(),
     ) -> crate::Result<()> {
+        let location_str = location.as_ref();
+
+        // Check if the path has the recursive delete suffix
+        let (actual_path, recursive) =
+            if let Some(real_path) = location_str.strip_suffix(DELETE_FILES_RECURSIVE_SUFFIX) {
+                trace_log!(
+                    self,
+                    "delete_request: deleting files recursively at path: {}",
+                    real_path
+                );
+                (Path::from(real_path), true)
+            } else {
+                (location.clone(), false)
+            };
+
+        let query = if recursive {
+            vec![("op", "DELETE"), ("recursive", "true")]
+        } else {
+            vec![("op", "DELETE")]
+        };
+
         let builder = self
-            .request(Method::DELETE, location)
+            .request(Method::DELETE, &actual_path)
             .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
-            .query(&[("op", "DELETE")]);
+            .query(&query);
 
         let _ = builder.send().await.map_err(|source| {
-            let path = location.as_ref().into();
+            let path = actual_path.as_ref().into();
             Error::Request { source, path }
         })?;
 
