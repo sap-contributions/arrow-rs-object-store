@@ -701,8 +701,25 @@ impl GetClient for SAPHdlfsClient {
         options: GetOptions,
     ) -> crate::Result<HttpResponse> {
         let method = Method::GET;
-
         let mut parameters = vec![("op".to_owned(), "OPEN".to_owned())];
+
+        // For metadata-only requests (no range) return file length without downloading the file content
+        if options.range.is_none() {
+            let file_len = self.get_file_length(path).await?;
+            trace_log!(
+                self,
+                "[get_request] metadata-only: path: {}, length: {}",
+                path,
+                file_len
+            );
+            // Build response with Content-Length header and empty body
+            let response = http::Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_LENGTH, file_len)
+                .body(HttpResponseBody::from(bytes::Bytes::new()))
+                .unwrap();
+            return Ok(response);
+        }
 
         // Rust range syntax start..end is half‑open: it includes start and excludes end ([start, end)).
         // HTTP Content-Range uses inclusive bounds: bytes start-end/total
