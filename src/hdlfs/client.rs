@@ -704,15 +704,9 @@ impl GetClient for SAPHdlfsClient {
         let mut parameters = vec![("op".to_owned(), "OPEN".to_owned())];
 
         // For metadata-only requests (no range) return file length without downloading the file content
-        if options.range.is_none() {
+        if options.range.is_none() && options.head {
             let file_len = self.get_file_length(path).await?;
-            trace_log!(
-                self,
-                "[get_request] metadata-only: path: {}, length: {}",
-                path,
-                file_len
-            );
-            // Build response with Content-Length header and empty body
+            trace_log!(self, "[get_request]: metadata-only request for path: {}, length: {}", path, file_len);
             let response = http::Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_LENGTH, file_len)
