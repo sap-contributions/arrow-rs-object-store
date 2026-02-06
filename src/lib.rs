@@ -516,6 +516,8 @@ pub mod chunked;
 pub mod delimited;
 #[cfg(feature = "gcp")]
 pub mod gcp;
+#[cfg(feature = "hdlfs")]
+pub mod hdlfs;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod limit;
