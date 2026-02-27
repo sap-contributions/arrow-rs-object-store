@@ -917,6 +917,11 @@ impl ListClient for Arc<SAPHdlfsClient> {
             }
         }));
 
+        // Sort objects by filename (location path) for Delta Lake compatibility
+        // Delta Lake requires commit files to be in sequential order (0, 1, 2, 3...)
+        // HDLFS returns files by modification_time, not lexicographic order
+        objects.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
+
         Ok(PaginatedListResult {
             result: ListResult {
                 common_prefixes,
