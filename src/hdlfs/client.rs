@@ -917,10 +917,20 @@ impl ListClient for Arc<SAPHdlfsClient> {
             }
         }));
 
-        // Sort objects by last_modified time (ascending: oldest to newest)
-        // This ensures Delta Lake commit files are in sequential order (0, 1, 2, 3...)
-        // since commit files are written sequentially over time
-        objects.sort_by(|a, b| a.last_modified.cmp(&b.last_modified));
+        // Only sort lexicographically when listing _delta_log directories.
+        // Delta Lake's kernel expects files in lexicographic order: after finding a
+        // checkpoint, it scans forward for subsequent commits. Without this sort,
+        // the checkpoint.parquet (written last) can appear after the next commit's
+        // .json in HDLFS's timestamp-based order, causing a version gap error.
+        if default_prefix.contains("_delta_log") {
+            trace_log!(
+                self,
+                "list_request: sorting {} objects lexicographically for _delta_log path: {:?}",
+                objects.len(),
+                default_prefix
+            );
+            objects.sort_by(|a, b| a.location.cmp(&b.location));
+        }
 
         Ok(PaginatedListResult {
             result: ListResult {
