@@ -784,9 +784,12 @@ impl S3Client {
         let credential = self.config.get_session_credential().await?;
         let url = self.config.path_url(location);
 
-        let request = self
-            .client
-            .post(url)
+        let mut builder = self.client.post(url);
+        if let Some(headers) = self.config.client_options.get_default_headers() {
+            builder = builder.headers(headers.clone());
+        }
+
+        let request = builder
             .query(&[("uploadId", upload_id)])
             .body(body)
             .with_aws_sigv4(credential.authorizer(), None);
@@ -1135,6 +1138,37 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+        mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_default_headers_signed_complete_multipart() {
+        let mock = MockServer::new().await;
+        mock.push_fn(|req| {
+            assert_default_headers_signed(&req);
+            assert!(req.uri().query().unwrap_or("").contains("uploadId"));
+
+            Response::builder()
+                .status(200)
+                .body("<CompleteMultipartUploadResult><ETag>\"test-etag\"</ETag></CompleteMultipartUploadResult>".to_string())
+                .unwrap()
+        });
+
+        let config = default_headers_config(&mock);
+        let client = S3Client::new(config, HttpClient::new(reqwest::Client::new()));
+
+        let parts = vec![PartId {
+            content_id: "\"part-etag\"".to_string(),
+        }];
+        let _ = client
+            .complete_multipart(
+                &Path::from("test"),
+                "test-upload-id",
+                parts,
+                CompleteMultipartMode::Overwrite,
+            )
+            .await
+            .unwrap();
         mock.shutdown().await;
     }
 }
