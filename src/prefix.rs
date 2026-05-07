@@ -84,12 +84,19 @@ fn strip_prefix(prefix: &Path, path: Path) -> Path {
 
 /// Strip the constant prefix from a given ObjectMeta
 fn strip_meta(prefix: &Path, meta: ObjectMeta) -> ObjectMeta {
+    let ObjectMeta {
+        last_modified,
+        size,
+        location,
+        e_tag,
+        version,
+    } = meta;
     ObjectMeta {
-        last_modified: meta.last_modified,
-        size: meta.size,
-        location: strip_prefix(prefix, meta.location),
-        e_tag: meta.e_tag,
-        version: None,
+        last_modified,
+        size,
+        location: strip_prefix(prefix, location),
+        e_tag,
+        version,
     }
 }
 
@@ -319,6 +326,32 @@ mod tests {
 
         // The returned location must round-trip back into the same store.
         store.get(&head.location).await.unwrap();
+    }
+
+    #[test]
+    fn strip_meta_preserves_version_and_etag() {
+        let prefix = Path::from("prefix");
+        let meta = ObjectMeta {
+            location: Path::from("prefix/foo"),
+            last_modified: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            size: 42,
+            e_tag: Some("etag-value".to_string()),
+            version: Some("version-value".to_string()),
+        };
+
+        let ObjectMeta {
+            location,
+            last_modified,
+            size,
+            e_tag,
+            version,
+        } = strip_meta(&prefix, meta.clone());
+
+        assert_eq!(location, Path::from("foo"));
+        assert_eq!(last_modified, meta.last_modified);
+        assert_eq!(size, meta.size);
+        assert_eq!(e_tag, meta.e_tag);
+        assert_eq!(version, meta.version);
     }
 
     #[tokio::test]
