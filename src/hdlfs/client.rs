@@ -67,6 +67,50 @@ const LIST_DLT_SUFFIX1: &str = "__list_delta_table_1__/";
 const LIST_DLT_SUFFIX2: &str = "__list_delta_table_2__/";
 const LIST_FILES_SUFFIX3: &str = "__list_files_recursive__/";
 const DELETE_FILES_RECURSIVE_SUFFIX: &str = "__delete_files_recursive__";
+const DELETE_FILES_DIRECT_ACCESS_SUFFIX: &str = "__delete_files_direct_access__";
+const READ_FILES_DIRECT_ACCESS_SUFFIX: &str = "__read_files_direct_access__";
+
+/// Parsed result of a direct-access path suffix.
+#[derive(Debug)]
+struct DirectAccessRequest {
+    /// The real folder path (without any suffix or duration).
+    real_path: String,
+    /// Privileges to request from GENERATE_TEMPORARY_CREDENTIALS.
+    privileges: Vec<&'static str>,
+    /// TTL in seconds to request; None means use server default (900 s).
+    duration_seconds: Option<u64>,
+}
+
+/// Strip a direct-access suffix (and optional trailing digits encoding the
+/// duration) from `path_str`.  Returns `None` when neither suffix matches.
+fn parse_direct_access_path(path_str: &str) -> Option<DirectAccessRequest> {
+    for (suffix, privileges) in [
+        (DELETE_FILES_DIRECT_ACCESS_SUFFIX, vec!["BROWSE", "DELETE"]),
+        (READ_FILES_DIRECT_ACCESS_SUFFIX,   vec!["OPEN", "BROWSE"]),
+    ] {
+        // The path may end with the bare suffix, or with the suffix followed
+        // by a decimal duration, e.g. "__delete_files_direct_access__3600".
+        let (real_path, duration_seconds) = if path_str.ends_with(suffix) {
+            (&path_str[..path_str.len() - suffix.len()], None)
+        } else if let Some(before) = path_str.rfind(suffix) {
+            let tail = &path_str[before + suffix.len()..];
+            if tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
+                (&path_str[..before], tail.parse::<u64>().ok())
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+
+        return Some(DirectAccessRequest {
+            real_path: real_path.trim_end_matches('/').to_owned(),
+            privileges,
+            duration_seconds,
+        });
+    }
+    None
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -98,6 +142,9 @@ pub enum Error {
     ListRequest {
         source: crate::client::retry::RetryError,
     },
+
+    #[error("Not supported: {message}")]
+    NotSupported { message: String },
 }
 
 impl From<Error> for crate::Error {
@@ -700,6 +747,79 @@ impl GetClient for SAPHdlfsClient {
         path: &Path,
         options: GetOptions,
     ) -> crate::Result<HttpResponse> {
+        // Handle Direct Access credential vending requests
+        let path_str = path.as_ref();
+        if let Some(da) = parse_direct_access_path(path_str) {
+            trace_log!(
+                self,
+                "[get_request]: direct access credential request — path: {}, privileges: {:?}, duration: {:?}",
+                da.real_path, da.privileges, da.duration_seconds
+            );
+
+            let empty_path = &Path::from("");
+
+            // Step 1: WHOAMI — gates the credential request on prefixModeEnabled.
+            // If the HTTP call itself fails (old server, network error), fall through
+            // non-fatally so the credential attempt still proceeds. If the call
+            // succeeds but prefixModeEnabled is false/absent/unparseable, return an
+            // explicit error rather than attempting GENERATE_TEMPORARY_CREDENTIALS.
+            let whoami_builder = self
+                .request(Method::GET, empty_path)
+                .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
+                .query(&[("op", "WHOAMI")]);
+
+            match whoami_builder.send().await {
+                Ok(whoami_resp) => {
+                    let enabled = whoami_resp.into_body().bytes().await
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        .and_then(|j| j.get("prefixModeEnabled").and_then(|v| v.as_bool()))
+                        .unwrap_or(false);
+                    trace_log!(self, "[get_request]: WHOAMI prefixModeEnabled={}", enabled);
+                    if !enabled {
+                        return Err(Error::NotSupported {
+                            message: format!(
+                                "HDLFS Direct Access (prefixModeEnabled) is not available for path '{}'. \
+                                 Use delete_files() for namenode-based deletion.",
+                                da.real_path
+                            ),
+                        }
+                        .into());
+                    }
+                }
+                Err(e) => {
+                    trace_log!(self, "[get_request]: WHOAMI call failed (non-fatal): {}", e);
+                }
+            }
+
+            // Step 2: GENERATE_TEMPORARY_CREDENTIALS — POST to root path with rules body.
+            let mut body = serde_json::json!({
+                "rules": [{
+                    "paths": [format!("/{}", da.real_path)],
+                    "privileges": da.privileges,
+                }]
+            });
+            if let Some(dur) = da.duration_seconds {
+                body["durationSeconds"] = serde_json::json!(dur);
+            }
+            let cred_json = serde_json::to_string(&body).unwrap();
+
+            let cred_builder = self
+                .request(Method::POST, empty_path)
+                .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
+                .header(HDLFS_CONTENT_TYPE, HDLFS_JSON)
+                .query(&[("op", "GENERATE_TEMPORARY_CREDENTIALS")])
+                .with_payload(PutPayload::from_bytes(cred_json.into()));
+
+            let cred_resp = cred_builder.send().await.map_err(|source| {
+                let path = path_str.to_string();
+                Error::GetRequest { source, path }
+            })?;
+
+            let (parts, body) = self.handle_chunked_response(cred_resp, path).await?;
+            return Ok(HttpResponse::from_parts(parts, body));
+        }
+
         let method = Method::GET;
         let mut parameters = vec![("op".to_owned(), "OPEN".to_owned())];
 
