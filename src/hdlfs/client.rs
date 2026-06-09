@@ -758,24 +758,35 @@ impl GetClient for SAPHdlfsClient {
 
             let empty_path = &Path::from("");
 
-            // Step 1: WHOAMI — gates the credential request on prefixModeEnabled.
+            // Step 1: WHOAMI — gates the credential request on direct-access-prefix-mode-enabled.
+            // X-SAP-FileContainer is required for authentication (server returns 401 without it).
             // If the HTTP call itself fails (old server, network error), fall through
-            // non-fatally so the credential attempt still proceeds. If the call
-            // succeeds but prefixModeEnabled is false/absent/unparseable, return an
-            // explicit error rather than attempting GENERATE_TEMPORARY_CREDENTIALS.
+            // non-fatally. If it succeeds but the flag is false/absent, return NotSupported.
             let whoami_builder = self
                 .request(Method::GET, empty_path)
                 .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
                 .query(&[("op", "WHOAMI")]);
 
+            // Response shape per spec:
+            // { "user": "...", "options": [
+            //     { "key": "direct-access-prefix-mode-enabled", "value": "true" },
+            //     ...
+            // ] }
+            // options is an array of {key, value} objects; value is always a string.
             match whoami_builder.send().await {
                 Ok(whoami_resp) => {
                     let enabled = whoami_resp.into_body().bytes().await
                         .ok()
                         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                        .and_then(|j| j.get("prefixModeEnabled").and_then(|v| v.as_bool()))
+                        .and_then(|j| j.get("options").and_then(|o| o.as_array()).map(|arr| {
+                            arr.iter().any(|entry| {
+                                entry.get("key").and_then(|k| k.as_str()) == Some("direct-access-prefix-mode-enabled")
+                                    && entry.get("value").and_then(|v| v.as_str()) == Some("true")
+                            })
+                        }))
                         .unwrap_or(false);
-                    trace_log!(self, "[get_request]: WHOAMI prefixModeEnabled={}", enabled);
+
+                    trace_log!(self, "[get_request]: WHOAMI direct-access-prefix-mode-enabled={}", enabled);
                     if !enabled {
                         return Err(Error::NotSupported {
                             message: format!(
@@ -793,16 +804,19 @@ impl GetClient for SAPHdlfsClient {
             }
 
             // Step 2: GENERATE_TEMPORARY_CREDENTIALS — POST to root path with rules body.
-            let mut body = serde_json::json!({
+            // The HDLFS response already contains everything Python needs (including
+            // `type` per credential), so we forward the bytes verbatim — no parsing,
+            // no injection, no re-serialisation.
+            let mut req_body = serde_json::json!({
                 "rules": [{
                     "paths": [format!("/{}", da.real_path)],
                     "privileges": da.privileges,
                 }]
             });
             if let Some(dur) = da.duration_seconds {
-                body["durationSeconds"] = serde_json::json!(dur);
+                req_body["durationSeconds"] = serde_json::json!(dur);
             }
-            let cred_json = serde_json::to_string(&body).unwrap();
+            let cred_json = serde_json::to_string(&req_body).unwrap();
 
             let cred_builder = self
                 .request(Method::POST, empty_path)
@@ -816,8 +830,49 @@ impl GetClient for SAPHdlfsClient {
                 Error::GetRequest { source, path }
             })?;
 
-            let (parts, body) = self.handle_chunked_response(cred_resp, path).await?;
-            return Ok(HttpResponse::from_parts(parts, body));
+            let (_parts, resp_body) = self.handle_chunked_response(cred_resp, path).await?;
+            let final_bytes = resp_body.bytes().await.map_err(|e| Error::Http { source: Box::new(e) })?;
+
+            // GetClient calls get_request twice — once with head=true (size probe),
+            // once with range=Some (read). Map both to the right HTTP shape:
+            //   range=Some → 206 Partial Content + Content-Range + sliced body
+            //   head=true  → 200 OK + Content-Length=total, empty body
+            //   else       → 200 OK + full body
+            let total = final_bytes.len();
+            let (status, body, content_range, content_length) = match &options.range {
+                Some(GetRange::Bounded(r)) => {
+                    let (s, e) = (r.start as usize, (r.end as usize).min(total));
+                    let cr = format!("bytes {}-{}/{}", s, e - 1, total);
+                    let slice = final_bytes.slice(s..e);
+                    let len = slice.len();
+                    (StatusCode::PARTIAL_CONTENT, slice, Some(cr), len)
+                }
+                Some(GetRange::Offset(o)) => {
+                    let s = *o as usize;
+                    let cr = format!("bytes {}-{}/{}", s, total - 1, total);
+                    let slice = final_bytes.slice(s..);
+                    let len = slice.len();
+                    (StatusCode::PARTIAL_CONTENT, slice, Some(cr), len)
+                }
+                Some(GetRange::Suffix(l)) => {
+                    let s = total.saturating_sub(*l as usize);
+                    let cr = format!("bytes {}-{}/{}", s, total - 1, total);
+                    let slice = final_bytes.slice(s..);
+                    let len = slice.len();
+                    (StatusCode::PARTIAL_CONTENT, slice, Some(cr), len)
+                }
+                // Head request: report the TOTAL size, not the (empty) body size,
+                // otherwise the client thinks the file is 0 bytes and skips the read.
+                None if options.head => (StatusCode::OK, bytes::Bytes::new(), None, total),
+                None => (StatusCode::OK, final_bytes, None, total),
+            };
+            let mut builder = http::Response::builder()
+                .status(status)
+                .header(CONTENT_LENGTH, content_length);
+            if let Some(cr) = content_range {
+                builder = builder.header(CONTENT_RANGE, cr);
+            }
+            return Ok(builder.body(HttpResponseBody::from(body)).unwrap());
         }
 
         let method = Method::GET;
