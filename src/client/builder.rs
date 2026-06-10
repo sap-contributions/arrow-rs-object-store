@@ -177,7 +177,13 @@ impl HttpRequestBuilder {
         self
     }
 
-    #[cfg(any(test, feature = "aws", feature = "gcp", feature = "azure"))]
+    #[cfg(any(
+        test,
+        feature = "aws",
+        feature = "gcp",
+        feature = "azure",
+        feature = "hdlfs"
+    ))]
     pub(crate) fn query<T: serde::Serialize + ?Sized>(mut self, query: &T) -> Self {
         let mut error = None;
         if let Ok(ref mut req) = self.request {

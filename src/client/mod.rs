@@ -30,12 +30,12 @@ pub(crate) mod mock_server;
 
 pub(crate) mod retry;
 
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
+#[cfg(any(feature = "aws", feature = "gcp", feature = "azure", feature = "hdlfs"))]
 pub(crate) mod pagination;
 
 pub(crate) mod get;
 
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
+#[cfg(any(feature = "aws", feature = "gcp", feature = "azure", feature = "hdlfs"))]
 pub(crate) mod list;
 
 #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
@@ -49,7 +49,7 @@ pub(crate) mod s3;
 pub(crate) mod builder;
 mod http;
 
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
+#[cfg(any(feature = "aws", feature = "gcp", feature = "azure", feature = "hdlfs"))]
 pub(crate) mod parts;
 pub use http::*;
 

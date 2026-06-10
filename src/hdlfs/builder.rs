@@ -39,13 +39,13 @@ use std::str::FromStr;
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error("Failed to parse URL {0}: {1}")]
-    UrlParseError(String, url::ParseError),
+    UrlParseFailed(String, url::ParseError),
     #[error("Config error: {0}")]
-    ConfigError(#[from] crate::Error),
+    Config(#[from] crate::Error),
     #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
     #[error("Reqwest error: {0}")]
-    ReqwestError(#[from] reqwest::Error),
+    Reqwest(#[from] reqwest::Error),
     #[error("URL parse error: {0}")]
     UrlParse(#[from] url::ParseError),
     #[error("Invalid key: {0}")]
@@ -70,17 +70,15 @@ enum Error {
 
 impl From<Error> for crate::Error {
     fn from(source: Error) -> Self {
-        match source {
-            _ => Self::Generic {
-                store: crate::hdlfs::STORE,
-                source: Box::new(source),
-            },
+        Self::Generic {
+            store: crate::hdlfs::STORE,
+            source: Box::new(source),
         }
     }
 }
 
 /// Builder for SAP HANA Cloud, Data Lake Files (hdlfs) client
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct SAPHdlfsBuilder {
     container_id: String,
     credential: SAPHdlfsCredential,
@@ -90,6 +88,24 @@ pub struct SAPHdlfsBuilder {
     use_emulator: crate::config::ConfigValue<bool>,
     retry_config: RetryConfig,
     client_options: ClientOptions,
+}
+
+impl Default for SAPHdlfsBuilder {
+    fn default() -> Self {
+        Self {
+            container_id: Default::default(),
+            credential: Default::default(),
+            url: Default::default(),
+            trace: Default::default(),
+            endpoint: Default::default(),
+            use_emulator: Default::default(),
+            retry_config: RetryConfig {
+                max_retries: 5,
+                ..Default::default()
+            },
+            client_options: Default::default(),
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Copy, Deserialize, Serialize)]
@@ -336,7 +352,7 @@ impl SAPHdlfsBuilder {
                 let parts: Vec<&str> = host.split('.').collect();
                 if parts.len() != 7 && parts.len() != 8 {
                     return Err(
-                        Error::UrlParseError(url.to_string(), url::ParseError::EmptyHost).into(),
+                        Error::UrlParseFailed(url.to_string(), url::ParseError::EmptyHost).into(),
                     );
                 }
                 self.container_id = parts[0].to_string();
@@ -358,8 +374,8 @@ impl SAPHdlfsBuilder {
     fn parse_endpoint(&mut self, custom_endpoint: &str) -> Result<()> {
         eprintln!("custom_endpoint: [{}]", custom_endpoint);
         let parts: Vec<&str> = custom_endpoint.split('.').collect();
-        if parts.len() != 7 {
-            return Err(Error::UrlParseError(
+        if parts.len() != 7 && parts.len() != 8 {
+            return Err(Error::UrlParseFailed(
                 custom_endpoint.to_string(),
                 url::ParseError::EmptyHost,
             )
@@ -419,10 +435,7 @@ impl SAPHdlfsBuilder {
         eprintln!("service_url: [{}]", service_url);
         let parsed_url = Url::parse(&service_url).map_err(Error::from)?;
 
-        let retry_config = RetryConfig {
-            max_retries: 5,
-            ..Default::default()
-        };
+        let retry_config = self.retry_config.clone();
 
         let config = SAPHdlfsConfig::new(
             self.container_id,
