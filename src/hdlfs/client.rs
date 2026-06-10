@@ -40,7 +40,8 @@ use crate::client::get::GetClient;
 use crate::client::list::ListClient;
 use crate::hdlfs::filestatus::FileStatusResponse;
 use crate::hdlfs::list::{
-    BatchDeleteWrapper, DeleteFile, DirectoryListing, MergeSource, MergeSourcesWrapper, NonRecursiveDirectoryListing,
+    BatchDeleteWrapper, DeleteFile, DirectoryListing, MergeSource, MergeSourcesWrapper,
+    NonRecursiveDirectoryListing,
 };
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
@@ -86,12 +87,12 @@ struct DirectAccessRequest {
 fn parse_direct_access_path(path_str: &str) -> Option<DirectAccessRequest> {
     for (suffix, privileges) in [
         (DELETE_FILES_DIRECT_ACCESS_SUFFIX, vec!["BROWSE", "DELETE"]),
-        (READ_FILES_DIRECT_ACCESS_SUFFIX,   vec!["OPEN", "BROWSE"]),
+        (READ_FILES_DIRECT_ACCESS_SUFFIX, vec!["OPEN", "BROWSE"]),
     ] {
         // The path may end with the bare suffix, or with the suffix followed
         // by a decimal duration, e.g. "__delete_files_direct_access__3600".
-        let (real_path, duration_seconds) = if path_str.ends_with(suffix) {
-            (&path_str[..path_str.len() - suffix.len()], None)
+        let (real_path, duration_seconds) = if let Some(stripped) = path_str.strip_suffix(suffix) {
+            (stripped, None)
         } else if let Some(before) = path_str.rfind(suffix) {
             let tail = &path_str[before + suffix.len()..];
             if tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
@@ -468,7 +469,7 @@ impl SAPHdlfsClient {
             .query(&[("op", "DELETE_BATCH")])
             .with_payload(PutPayload::from_bytes(delete_json.into()));
 
-        Ok(builder.do_put().await?)
+        builder.do_put().await
     }
 
     pub(crate) async fn delete_request(
@@ -775,18 +776,29 @@ impl GetClient for SAPHdlfsClient {
             // options is an array of {key, value} objects; value is always a string.
             match whoami_builder.send().await {
                 Ok(whoami_resp) => {
-                    let enabled = whoami_resp.into_body().bytes().await
+                    let enabled = whoami_resp
+                        .into_body()
+                        .bytes()
+                        .await
                         .ok()
                         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                        .and_then(|j| j.get("options").and_then(|o| o.as_array()).map(|arr| {
-                            arr.iter().any(|entry| {
-                                entry.get("key").and_then(|k| k.as_str()) == Some("direct-access-prefix-mode-enabled")
-                                    && entry.get("value").and_then(|v| v.as_str()) == Some("true")
+                        .and_then(|j| {
+                            j.get("options").and_then(|o| o.as_array()).map(|arr| {
+                                arr.iter().any(|entry| {
+                                    entry.get("key").and_then(|k| k.as_str())
+                                        == Some("direct-access-prefix-mode-enabled")
+                                        && entry.get("value").and_then(|v| v.as_str())
+                                            == Some("true")
+                                })
                             })
-                        }))
+                        })
                         .unwrap_or(false);
 
-                    trace_log!(self, "[get_request]: WHOAMI direct-access-prefix-mode-enabled={}", enabled);
+                    trace_log!(
+                        self,
+                        "[get_request]: WHOAMI direct-access-prefix-mode-enabled={}",
+                        enabled
+                    );
                     if !enabled {
                         return Err(Error::NotSupported {
                             message: format!(
@@ -831,7 +843,9 @@ impl GetClient for SAPHdlfsClient {
             })?;
 
             let (_parts, resp_body) = self.handle_chunked_response(cred_resp, path).await?;
-            let final_bytes = resp_body.bytes().await.map_err(|e| Error::Http { source: Box::new(e) })?;
+            let final_bytes = resp_body.bytes().await.map_err(|e| Error::Http {
+                source: Box::new(e),
+            })?;
 
             // GetClient calls get_request twice — once with head=true (size probe),
             // once with range=Some (read). Map both to the right HTTP shape:
@@ -881,7 +895,12 @@ impl GetClient for SAPHdlfsClient {
         // For metadata-only requests (no range) return file length without downloading the file content
         if options.range.is_none() && options.head {
             let file_len = self.get_file_length(path).await?;
-            trace_log!(self, "[get_request]: metadata-only request for path: {}, length: {}", path, file_len);
+            trace_log!(
+                self,
+                "[get_request]: metadata-only request for path: {}, length: {}",
+                path,
+                file_len
+            );
             let response = http::Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_LENGTH, file_len)
