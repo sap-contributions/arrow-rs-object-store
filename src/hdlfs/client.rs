@@ -33,13 +33,12 @@ use crate::{ListResult, ObjectMeta};
 use crate::{ClientOptions, Result, RetryConfig};
 
 use crate::client::HttpResponse;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::str::FromStr;
+use serde::Serialize;
 use std::sync::Arc;
 
 use crate::client::get::GetClient;
 use crate::client::list::ListClient;
+use crate::hdlfs::direct_access;
 use crate::hdlfs::filestatus::FileStatusResponse;
 use crate::hdlfs::list::{
     BatchDeleteWrapper, DeleteFile, DirectoryListing, MergeSource, MergeSourcesWrapper,
@@ -65,13 +64,6 @@ const HDLFS_FILE_CONTAINER: &str = "X-SAP-FileContainer";
 const HDLFS_CONTENT_TYPE: &str = "Content-Type";
 const HDLFS_BINARY: &str = "application/octet-stream";
 const HDLFS_JSON: &str = "application/json";
-
-/// Sent by the client to advertise that it can follow a direct-access
-/// redirect to the underlying object store.
-const ACCEPT_DIRECT_ACCESS_HEADER: &str = "X-SAP-Accept-Direct-Access";
-/// Set by HDLFS when the response body is a direct-access redirect
-/// descriptor instead of file data.
-const DIRECT_ACCESS_HEADER: &str = "X-SAP-Direct-Access";
 
 const LIST_DLT_SUFFIX1: &str = "__list_delta_table_1__/";
 const LIST_DLT_SUFFIX2: &str = "__list_delta_table_2__/";
@@ -120,47 +112,6 @@ fn parse_direct_access_path(path_str: &str) -> Option<DirectAccessRequest> {
         });
     }
     None
-}
-
-/// JSON body HDLFS returns when delegating an OPEN/CREATE to the
-/// underlying object store. The client replays the request against
-/// `endpoint` with `method` and `headers`.
-#[derive(Deserialize, Debug)]
-struct DirectAccessProperties {
-    endpoint: String,
-    method: String,
-    #[serde(default)]
-    headers: HashMap<String, String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct DirectAccessResponse {
-    properties: DirectAccessProperties,
-}
-
-fn empty_bad_gateway() -> HttpResponse {
-    http::Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .header(CONTENT_LENGTH, 0)
-        .body(HttpResponseBody::from(bytes::Bytes::new()))
-        .unwrap()
-}
-
-/// HDLFS reports an existing file on `CREATE&overwrite=false` with a
-/// 403 response whose body carries `FileAlreadyExistsException`.
-fn hdlfs_already_exists(source: &(dyn std::error::Error + Send + Sync)) -> bool {
-    let mut current: Option<&dyn std::error::Error> = Some(source);
-    while let Some(err) = current {
-        let msg = err.to_string();
-        if msg.contains("FileAlreadyExistsException")
-            || msg.contains("AlreadyExists")
-            || msg.contains("already exists")
-        {
-            return true;
-        }
-        current = err.source();
-    }
-    false
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -217,6 +168,27 @@ impl From<Error> for crate::Error {
     }
 }
 
+fn map_put_error(
+    location: &Path,
+    mode: PutMode,
+    source: crate::client::retry::RetryError,
+) -> crate::Error {
+    use http::StatusCode;
+    let path = location.as_ref().to_string();
+    if matches!(mode, PutMode::Create) {
+        let already_exists = source.status() == Some(StatusCode::CONFLICT)
+            || source.status() == Some(StatusCode::PRECONDITION_FAILED)
+            || source.body().is_some_and(direct_access::is_already_exists);
+        if already_exists {
+            return crate::Error::AlreadyExists {
+                path,
+                source: Box::new(source),
+            };
+        }
+    }
+    Error::Request { source, path }.into()
+}
+
 /// SAP HANA Cloud, Data Lake Files (hdlfs) client configuration
 #[derive(Debug, Clone)]
 pub(crate) struct SAPHdlfsConfig {
@@ -267,12 +239,8 @@ impl SAPHdlfsConfig {
 pub(crate) struct Request<'a> {
     path: &'a Path,
     config: &'a SAPHdlfsConfig,
-    client: &'a HttpClient,
     payload: Option<PutPayload>,
     builder: HttpRequestBuilder,
-    direct_access: bool,
-    direct_access_range: Option<(u64, u64)>,
-    direct_access_if_none_match: bool,
     #[allow(dead_code)]
     idempotent: bool,
 }
@@ -281,32 +249,6 @@ impl Request<'_> {
     fn header(self, k: &str, v: &str) -> Self {
         let builder = self.builder.header(k, v);
         Self { builder, ..self }
-    }
-
-    /// Send `X-SAP-Accept-Direct-Access: true` and follow a direct-access
-    /// redirect transparently. No-op when direct access is not configured.
-    fn accept_direct_access(self) -> Self {
-        if !self.config.direct_access {
-            return self;
-        }
-        let builder = self.builder.header(ACCEPT_DIRECT_ACCESS_HEADER, "true");
-        Self {
-            builder,
-            direct_access: true,
-            ..self
-        }
-    }
-
-    /// Range to forward as a `Range` header on a direct-access GET.
-    fn with_direct_access_range(mut self, start: u64, end_inclusive: u64) -> Self {
-        self.direct_access_range = Some((start, end_inclusive));
-        self
-    }
-
-    /// Echo `If-None-Match: *` on a direct-access put-if-absent upload.
-    fn with_direct_access_if_none_match(mut self) -> Self {
-        self.direct_access_if_none_match = true;
-        self
     }
 
     fn query<T: Serialize + ?Sized + Sync>(self, query: &T) -> Self {
@@ -335,75 +277,9 @@ impl Request<'_> {
     }
 
     async fn send(self) -> Result<HttpResponse, crate::client::retry::RetryError> {
-        let direct_access = self.direct_access;
-        let direct_access_range = self.direct_access_range;
-        let direct_access_if_none_match = self.direct_access_if_none_match;
-        let payload = self.payload.clone();
-        let response = self
-            .builder
+        self.builder
             .retryable(&self.config.retry_config)
             .payload(self.payload)
-            .send()
-            .await?;
-
-        if !direct_access {
-            return Ok(response);
-        }
-
-        let is_direct_access = response.status().is_success()
-            && response
-                .headers()
-                .get(DIRECT_ACCESS_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.eq_ignore_ascii_case("true"))
-                == Some(true);
-        if !is_direct_access {
-            return Ok(response);
-        }
-
-        // Body is a JSON descriptor; replay the request against the
-        // supplied endpoint.
-        let body = match response.into_body().bytes().await {
-            Ok(b) => b,
-            Err(_) => return Ok(empty_bad_gateway()),
-        };
-
-        let descriptor: DirectAccessResponse = match serde_json::from_slice(&body) {
-            Ok(d) => d,
-            Err(_) => return Ok(empty_bad_gateway()),
-        };
-
-        let method = match Method::from_str(&descriptor.properties.method) {
-            Ok(m) => m,
-            Err(_) => return Ok(empty_bad_gateway()),
-        };
-
-        let mut redirect = self.client.request(method, descriptor.properties.endpoint);
-        let mut descriptor_has_range = false;
-        let mut descriptor_has_if_none_match = false;
-        for (key, value) in descriptor.properties.headers {
-            if key.eq_ignore_ascii_case("range") {
-                descriptor_has_range = true;
-            }
-            if key.eq_ignore_ascii_case("if-none-match") {
-                descriptor_has_if_none_match = true;
-            }
-            redirect = redirect.header(key.as_str(), value.as_str());
-        }
-
-        if let Some((start, end_inclusive)) = direct_access_range {
-            if !descriptor_has_range {
-                redirect = redirect.header("Range", &format!("bytes={}-{}", start, end_inclusive));
-            }
-        }
-
-        if direct_access_if_none_match && !descriptor_has_if_none_match {
-            redirect = redirect.header("If-None-Match", "*");
-        }
-
-        redirect
-            .retryable(&self.config.retry_config)
-            .payload(payload)
             .send()
             .await
     }
@@ -465,10 +341,6 @@ impl SAPHdlfsClient {
             builder,
             payload: None,
             config: &self.config,
-            client: &self.client,
-            direct_access: false,
-            direct_access_range: None,
-            direct_access_if_none_match: false,
             idempotent: false,
         }
     }
@@ -525,25 +397,56 @@ impl SAPHdlfsClient {
             .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
             .header(HDLFS_CONTENT_TYPE, HDLFS_BINARY)
             .query(&[("op", "CREATE"), ("data", "true")]) // Adds ?op=CREATE&data=true
-            .with_payload(payload)
-            .with_extensions(extensions)
-            .accept_direct_access();
-
-        if let PutMode::Create = mode {
-            builder = builder.with_direct_access_if_none_match();
+            .with_payload(payload.clone())
+            .with_extensions(extensions);
+        if self.config.direct_access {
+            builder = builder.header(direct_access::ACCEPT_HEADER, "true");
         }
 
-        match (mode, builder.do_put().await) {
-            (PutMode::Create, Err(crate::Error::Precondition { path, source })) => {
-                Err(crate::Error::AlreadyExists { path, source })
+        let path_str = location.as_ref().to_string();
+        let response = match builder.send().await {
+            Ok(r) => r,
+            Err(source) => {
+                return Err(map_put_error(location, mode, source));
             }
-            (PutMode::Create, Err(crate::Error::PermissionDenied { path, source }))
-                if hdlfs_already_exists(source.as_ref()) =>
-            {
-                Err(crate::Error::AlreadyExists { path, source })
-            }
-            (_, r) => r,
-        }
+        };
+
+        let response = if direct_access::is_redirect(&response) {
+            direct_access::follow(
+                &self.client,
+                &self.config.retry_config,
+                response,
+                Some(payload),
+                direct_access::ReplayOptions {
+                    if_none_match: matches!(mode, PutMode::Create),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| match e {
+                crate::Error::Precondition { source, .. } if matches!(mode, PutMode::Create) => {
+                    crate::Error::AlreadyExists {
+                        path: path_str.clone(),
+                        source,
+                    }
+                }
+                other => other,
+            })?
+        } else {
+            response
+        };
+
+        let e_tag = response
+            .headers()
+            .get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // HDLFS does not provide version or etag in headers, so return default PutResult
+        Ok(PutResult {
+            e_tag,
+            version: None,
+        })
     }
 
     pub(crate) async fn put_block(
@@ -1117,16 +1020,30 @@ impl GetClient for SAPHdlfsClient {
         let mut builder = self
             .request(method, path)
             .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
-            .query(&parameters)
-            .accept_direct_access();
-        if let Some((s, e)) = da_range_inclusive {
-            builder = builder.with_direct_access_range(s, e);
+            .query(&parameters);
+        if self.config.direct_access {
+            builder = builder.header(direct_access::ACCEPT_HEADER, "true");
         }
 
         let response = builder.send().await;
 
         match response {
             Ok(resp) => {
+                let resp = if direct_access::is_redirect(&resp) {
+                    direct_access::follow(
+                        &self.client,
+                        &self.config.retry_config,
+                        resp,
+                        None,
+                        direct_access::ReplayOptions {
+                            range: da_range_inclusive,
+                            ..Default::default()
+                        },
+                    )
+                    .await?
+                } else {
+                    resp
+                };
                 if options.range.is_some() {
                     let (mut parts, body) = self.handle_chunked_response(resp, path).await?;
                     parts
@@ -1312,58 +1229,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_direct_access_descriptor() {
-        let json = r#"{
-            "properties": {
-                "endpoint": "https://bucket.s3.amazonaws.com/key?X-Amz-Signature=...",
-                "method": "GET",
-                "headers": {
-                    "x-amz-server-side-encryption": "AES256"
-                }
-            }
-        }"#;
-
-        let descriptor: DirectAccessResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(descriptor.properties.method, "GET");
-        assert!(descriptor.properties.endpoint.contains("X-Amz-Signature"));
-        assert_eq!(
-            descriptor
-                .properties
-                .headers
-                .get("x-amz-server-side-encryption")
-                .map(String::as_str),
-            Some("AES256")
-        );
-    }
-
-    #[test]
-    fn descriptor_headers_default_to_empty() {
-        let json = r#"{
-            "properties": {
-                "endpoint": "https://example.invalid/path",
-                "method": "PUT"
-            }
-        }"#;
-
-        let descriptor: DirectAccessResponse = serde_json::from_str(json).unwrap();
-        assert!(descriptor.properties.headers.is_empty());
-    }
-
-    #[test]
-    fn already_exists_matches_hdlfs_body() {
-        #[derive(Debug)]
-        struct Err(&'static str);
-        impl std::fmt::Display for Err {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}", self.0)
-            }
-        }
-        impl std::error::Error for Err {}
-
-        assert!(hdlfs_already_exists(&Err(
-            "Server returned non-2xx: 403: org.apache.hadoop.fs.FileAlreadyExistsException: ..."
-        )));
-        assert!(hdlfs_already_exists(&Err("file already exists at /foo")));
-        assert!(!hdlfs_already_exists(&Err("Forbidden: not authorized")));
+    fn map_put_error_uses_remote_exception() {
+        // Smoke test: the `map_put_error` helper relies on
+        // `direct_access::is_already_exists` for body inspection.
+        // Detailed parsing tests live alongside that helper.
+        assert!(direct_access::is_already_exists(
+            r#"{"RemoteException":{"exception":"FileAlreadyExistsException"}}"#
+        ));
     }
 }
