@@ -69,8 +69,8 @@ const HDLFS_JSON: &str = "application/json";
 /// Sent by the client to advertise that it can follow a direct-access
 /// redirect to the underlying object store.
 const ACCEPT_DIRECT_ACCESS_HEADER: &str = "X-SAP-Accept-Direct-Access";
-/// Returned by HDLFS when the response payload is a direct-access redirect
-/// (an `ObjectStoreRedirectResponse` JSON body) instead of file data.
+/// Set by HDLFS when the response body is a direct-access redirect
+/// descriptor instead of file data.
 const DIRECT_ACCESS_HEADER: &str = "X-SAP-Direct-Access";
 
 const LIST_DLT_SUFFIX1: &str = "__list_delta_table_1__/";
@@ -122,12 +122,9 @@ fn parse_direct_access_path(path_str: &str) -> Option<DirectAccessRequest> {
     None
 }
 
-/// Properties block returned inside a direct-access redirect response.
-///
-/// HDLFS responds with this JSON when the request advertised
-/// `X-SAP-Accept-Direct-Access: true` and the server elected to fulfil it
-/// directly from the underlying object store. The client must replay the
-/// request against `endpoint` using `method` and the supplied `headers`.
+/// JSON body HDLFS returns when delegating an OPEN/CREATE to the
+/// underlying object store. The client replays the request against
+/// `endpoint` with `method` and `headers`.
 #[derive(Deserialize, Debug)]
 struct DirectAccessProperties {
     endpoint: String,
@@ -141,11 +138,6 @@ struct DirectAccessResponse {
     properties: DirectAccessProperties,
 }
 
-/// Build an empty 502 Bad Gateway response.
-///
-/// Used when a direct-access descriptor returned by HDLFS cannot be parsed —
-/// surfacing a synthetic upstream error is safer than returning the
-/// (otherwise-empty) response and letting the caller treat it as success.
 fn empty_bad_gateway() -> HttpResponse {
     http::Response::builder()
         .status(StatusCode::BAD_GATEWAY)
@@ -218,9 +210,7 @@ pub(crate) struct SAPHdlfsConfig {
     pub is_emulator: bool,
     #[allow(dead_code)]
     pub trace: bool,
-    /// Opt-in: send `X-SAP-Accept-Direct-Access: true` with each request and
-    /// transparently follow direct-access redirects when the server returns
-    /// them. Not strict: server may still respond through the namenode.
+    /// Opt into direct-access redirects.
     pub direct_access: bool,
     #[allow(dead_code)]
     pub client_options: ClientOptions,
@@ -263,17 +253,8 @@ pub(crate) struct Request<'a> {
     client: &'a HttpClient,
     payload: Option<PutPayload>,
     builder: HttpRequestBuilder,
-    /// When set, advertise direct-access support and follow the resulting
-    /// redirect transparently. Only enabled by callers that issue OPEN or
-    /// CREATE; the spec exposes the header on no other operation.
     direct_access: bool,
-    /// When direct access redirects an OPEN to the underlying object store,
-    /// HDLFS does not bake the byte range into the presigned URL — the
-    /// client must add a `Range` header to the redirected GET.
     direct_access_range: Option<(u64, u64)>,
-    /// When direct access redirects a CREATE with put-if-absent semantics,
-    /// the presigned URL is signed with `If-None-Match: *`; the client
-    /// must echo that header to S3 / Azure or the upload is rejected.
     direct_access_if_none_match: bool,
     #[allow(dead_code)]
     idempotent: bool,
@@ -285,10 +266,8 @@ impl Request<'_> {
         Self { builder, ..self }
     }
 
-    /// Advertise `X-SAP-Accept-Direct-Access: true` and transparently
-    /// follow a direct-access redirect when the server returns one.
-    /// No-op when the client was configured with direct access disabled.
-    /// Only OPEN and CREATE expose this header per the HDLFS spec.
+    /// Send `X-SAP-Accept-Direct-Access: true` and follow a direct-access
+    /// redirect transparently. No-op when direct access is not configured.
     fn accept_direct_access(self) -> Self {
         if !self.config.direct_access {
             return self;
@@ -301,15 +280,13 @@ impl Request<'_> {
         }
     }
 
-    /// For an OPEN that may be served by direct access, record the range so
-    /// it can be applied to the redirected GET via a `Range` header.
+    /// Range to forward as a `Range` header on a direct-access GET.
     fn with_direct_access_range(mut self, start: u64, end_inclusive: u64) -> Self {
         self.direct_access_range = Some((start, end_inclusive));
         self
     }
 
-    /// For a CREATE with put-if-absent semantics under direct access,
-    /// echo `If-None-Match: *` to the redirected upload.
+    /// Echo `If-None-Match: *` on a direct-access put-if-absent upload.
     fn with_direct_access_if_none_match(mut self) -> Self {
         self.direct_access_if_none_match = true;
         self
@@ -366,9 +343,8 @@ impl Request<'_> {
             return Ok(response);
         }
 
-        // Server elected to serve this request directly from the underlying
-        // object store. The body is a JSON descriptor; replay the request
-        // against the supplied endpoint with the supplied headers/method.
+        // Body is a JSON descriptor; replay the request against the
+        // supplied endpoint.
         let body = match response.into_body().bytes().await {
             Ok(b) => b,
             Err(_) => return Ok(empty_bad_gateway()),
@@ -384,9 +360,6 @@ impl Request<'_> {
             Err(_) => return Ok(empty_bad_gateway()),
         };
 
-        // The presigned URL is auth-bearing; it does not need the HDLFS
-        // client certificate, container header, or accept-direct-access
-        // header. Send it as a fresh request.
         let mut redirect = self.client.request(method, descriptor.properties.endpoint);
         let mut descriptor_has_range = false;
         let mut descriptor_has_if_none_match = false;
@@ -400,18 +373,12 @@ impl Request<'_> {
             redirect = redirect.header(key.as_str(), value.as_str());
         }
 
-        // OPEN: HDLFS does not embed the requested byte range in the
-        // presigned URL — pass it on as a `Range` header unless the
-        // descriptor already supplied one.
         if let Some((start, end_inclusive)) = direct_access_range {
             if !descriptor_has_range {
                 redirect = redirect.header("Range", &format!("bytes={}-{}", start, end_inclusive));
             }
         }
 
-        // CREATE put-if-absent: S3 / Azure presigned URLs are signed with
-        // `If-None-Match: *`; if the client omits it the upload is
-        // rejected with a signature mismatch.
         if direct_access_if_none_match && !descriptor_has_if_none_match {
             redirect = redirect.header("If-None-Match", "*");
         }
@@ -544,8 +511,6 @@ impl SAPHdlfsClient {
             .with_extensions(extensions)
             .accept_direct_access();
 
-        // Mirror HDLFS server-side put-if-absent semantics through the
-        // presigned URL when CREATE is delegated to direct access.
         if let PutMode::Create = mode {
             builder = builder.with_direct_access_if_none_match();
         }

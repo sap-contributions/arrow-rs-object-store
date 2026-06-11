@@ -156,11 +156,7 @@ pub enum SAPHdlfsConfigKey {
     /// - `trace`
     Trace,
 
-    /// Whether to opt into HDLFS direct-access (cloud-storage redirects).
-    /// When enabled, the client sends `X-SAP-Accept-Direct-Access: true` and
-    /// follows the returned object-store redirect for supported operations.
-    /// HDLFS may still serve the request through the namenode if direct
-    /// access is not available; the header is advisory, not required.
+    /// Opt into HDLFS direct-access redirects.
     ///
     /// Supported keys:
     /// - `hdlfs_direct_access`
@@ -315,14 +311,6 @@ impl SAPHdlfsBuilder {
     }
 
     /// Opt into HDLFS direct-access redirects.
-    ///
-    /// When enabled, the client advertises support via the
-    /// `X-SAP-Accept-Direct-Access: true` request header. If the HDLFS server
-    /// chooses to serve a request directly from the underlying object store
-    /// (S3 / WASB / GCS), the client transparently follows the returned
-    /// redirect using the credentials supplied in the response. The header is
-    /// advisory: HDLFS may still serve the request through the namenode, in
-    /// which case the response is processed normally.
     pub fn with_direct_access(mut self, direct_access: bool) -> Self {
         self.direct_access = direct_access.into();
         self
