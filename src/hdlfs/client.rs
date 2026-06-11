@@ -1234,10 +1234,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn map_put_error_uses_remote_exception() {
-        // Smoke test: the `map_put_error` helper relies on
-        // `direct_access::is_already_exists` for body inspection.
-        // Detailed parsing tests live alongside that helper.
+    fn already_exists_recognised() {
         assert!(direct_access::is_already_exists(
             r#"{"RemoteException":{"exception":"FileAlreadyExistsException"}}"#
         ));

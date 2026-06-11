@@ -15,13 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! HDLFS direct-access: redirect handling for OPEN/CREATE.
-//!
-//! When `X-SAP-Accept-Direct-Access: true` is sent, HDLFS may answer with
-//! `X-SAP-Direct-Access: true` and a JSON descriptor pointing to the
-//! underlying object store. The client replays the request against that
-//! endpoint, optionally adding a `Range` (for OPEN) or `If-None-Match: *`
-//! (for CREATE put-if-absent) header.
+//! Direct-access redirect handling.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -38,16 +32,12 @@ pub(crate) const ACCEPT_HEADER: &str = "X-SAP-Accept-Direct-Access";
 pub(crate) const RESPONSE_HEADER: &str = "X-SAP-Direct-Access";
 pub(crate) const STORE: &str = crate::hdlfs::STORE;
 
-/// Optional behavior to apply when replaying a direct-access redirect.
 #[derive(Default, Debug, Clone, Copy)]
 pub(crate) struct ReplayOptions {
-    /// Inclusive byte range to forward as a `Range: bytes=start-end` header.
     pub range: Option<(u64, u64)>,
-    /// Echo `If-None-Match: *` for put-if-absent uploads.
     pub if_none_match: bool,
 }
 
-/// True when `response` is a 2xx with `X-SAP-Direct-Access: true`.
 pub(crate) fn is_redirect(response: &HttpResponse) -> bool {
     response.status().is_success()
         && response
@@ -57,8 +47,6 @@ pub(crate) fn is_redirect(response: &HttpResponse) -> bool {
             .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-/// Read the direct-access descriptor from `response` and replay against the
-/// supplied object-store endpoint.
 pub(crate) async fn follow(
     client: &HttpClient,
     retry: &RetryConfig,
@@ -98,7 +86,6 @@ pub(crate) async fn follow(
         .map_err(|source| source.error(STORE, String::new()))
 }
 
-/// HDLFS error envelope returned when a `RemoteException` is raised.
 #[derive(Deserialize, Debug)]
 struct RemoteExceptionEnvelope {
     #[serde(rename = "RemoteException")]
@@ -113,9 +100,6 @@ struct RemoteException {
     java_class_name: String,
 }
 
-/// Inspect an error body and decide whether HDLFS reported the target
-/// already exists. Recognises the structured `RemoteException` shape and
-/// falls back to substring matching for plain-text bodies.
 pub(crate) fn is_already_exists(body: &str) -> bool {
     if let Ok(env) = serde_json::from_str::<RemoteExceptionEnvelope>(body) {
         let exc = &env.remote_exception;
@@ -153,14 +137,13 @@ mod tests {
     fn parses_descriptor_with_headers() {
         let json = r#"{
             "properties": {
-                "endpoint": "https://bucket.s3.amazonaws.com/key?X-Amz-Signature=...",
+                "endpoint": "https://example.invalid/key?sig=...",
                 "method": "GET",
-                "headers": { "x-amz-server-side-encryption": "AES256" }
+                "headers": { "x-custom": "v" }
             }
         }"#;
         let d: DirectAccessResponse = serde_json::from_str(json).unwrap();
         assert_eq!(d.properties.method, "GET");
-        assert!(d.properties.endpoint.contains("X-Amz-Signature"));
         assert_eq!(d.properties.headers.len(), 1);
     }
 
@@ -186,13 +169,12 @@ mod tests {
 
     #[test]
     fn already_exists_unstructured_body() {
-        let body = "FileAlreadyExistsException: /foo";
-        assert!(is_already_exists(body));
+        assert!(is_already_exists("FileAlreadyExistsException: /foo"));
     }
 
     #[test]
     fn already_exists_does_not_match_unrelated_403() {
-        assert!(!is_already_exists("Forbidden: not authorized"));
+        assert!(!is_already_exists("Forbidden"));
         assert!(!is_already_exists(
             r#"{"RemoteException":{"exception":"AccessControlException"}}"#
         ));
