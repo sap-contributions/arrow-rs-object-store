@@ -263,6 +263,18 @@ pub(crate) struct Request<'a> {
     client: &'a HttpClient,
     payload: Option<PutPayload>,
     builder: HttpRequestBuilder,
+    /// When set, advertise direct-access support and follow the resulting
+    /// redirect transparently. Only enabled by callers that issue OPEN or
+    /// CREATE; the spec exposes the header on no other operation.
+    direct_access: bool,
+    /// When direct access redirects an OPEN to the underlying object store,
+    /// HDLFS does not bake the byte range into the presigned URL — the
+    /// client must add a `Range` header to the redirected GET.
+    direct_access_range: Option<(u64, u64)>,
+    /// When direct access redirects a CREATE with put-if-absent semantics,
+    /// the presigned URL is signed with `If-None-Match: *`; the client
+    /// must echo that header to S3 / Azure or the upload is rejected.
+    direct_access_if_none_match: bool,
     #[allow(dead_code)]
     idempotent: bool,
 }
@@ -271,6 +283,36 @@ impl Request<'_> {
     fn header(self, k: &str, v: &str) -> Self {
         let builder = self.builder.header(k, v);
         Self { builder, ..self }
+    }
+
+    /// Advertise `X-SAP-Accept-Direct-Access: true` and transparently
+    /// follow a direct-access redirect when the server returns one.
+    /// No-op when the client was configured with direct access disabled.
+    /// Only OPEN and CREATE expose this header per the HDLFS spec.
+    fn accept_direct_access(self) -> Self {
+        if !self.config.direct_access {
+            return self;
+        }
+        let builder = self.builder.header(ACCEPT_DIRECT_ACCESS_HEADER, "true");
+        Self {
+            builder,
+            direct_access: true,
+            ..self
+        }
+    }
+
+    /// For an OPEN that may be served by direct access, record the range so
+    /// it can be applied to the redirected GET via a `Range` header.
+    fn with_direct_access_range(mut self, start: u64, end_inclusive: u64) -> Self {
+        self.direct_access_range = Some((start, end_inclusive));
+        self
+    }
+
+    /// For a CREATE with put-if-absent semantics under direct access,
+    /// echo `If-None-Match: *` to the redirected upload.
+    fn with_direct_access_if_none_match(mut self) -> Self {
+        self.direct_access_if_none_match = true;
+        self
     }
 
     fn query<T: Serialize + ?Sized + Sync>(self, query: &T) -> Self {
@@ -299,7 +341,9 @@ impl Request<'_> {
     }
 
     async fn send(self) -> Result<HttpResponse, crate::client::retry::RetryError> {
-        let direct_access = self.config.direct_access;
+        let direct_access = self.direct_access;
+        let direct_access_range = self.direct_access_range;
+        let direct_access_if_none_match = self.direct_access_if_none_match;
         let payload = self.payload.clone();
         let response = self
             .builder
@@ -327,8 +371,6 @@ impl Request<'_> {
         // against the supplied endpoint with the supplied headers/method.
         let body = match response.into_body().bytes().await {
             Ok(b) => b,
-            // Cannot read redirect descriptor — surface a synthetic 502 so
-            // the caller does not interpret an empty body as success.
             Err(_) => return Ok(empty_bad_gateway()),
         };
 
@@ -346,8 +388,32 @@ impl Request<'_> {
         // client certificate, container header, or accept-direct-access
         // header. Send it as a fresh request.
         let mut redirect = self.client.request(method, descriptor.properties.endpoint);
+        let mut descriptor_has_range = false;
+        let mut descriptor_has_if_none_match = false;
         for (key, value) in descriptor.properties.headers {
+            if key.eq_ignore_ascii_case("range") {
+                descriptor_has_range = true;
+            }
+            if key.eq_ignore_ascii_case("if-none-match") {
+                descriptor_has_if_none_match = true;
+            }
             redirect = redirect.header(key.as_str(), value.as_str());
+        }
+
+        // OPEN: HDLFS does not embed the requested byte range in the
+        // presigned URL — pass it on as a `Range` header unless the
+        // descriptor already supplied one.
+        if let Some((start, end_inclusive)) = direct_access_range {
+            if !descriptor_has_range {
+                redirect = redirect.header("Range", &format!("bytes={}-{}", start, end_inclusive));
+            }
+        }
+
+        // CREATE put-if-absent: S3 / Azure presigned URLs are signed with
+        // `If-None-Match: *`; if the client omits it the upload is
+        // rejected with a signature mismatch.
+        if direct_access_if_none_match && !descriptor_has_if_none_match {
+            redirect = redirect.header("If-None-Match", "*");
         }
 
         redirect
@@ -409,18 +475,15 @@ impl SAPHdlfsClient {
         let uri = self.object_url(path);
         let builder = self.client.request(method, uri);
 
-        let builder = if self.config.direct_access {
-            builder.header(ACCEPT_DIRECT_ACCESS_HEADER, "true")
-        } else {
-            builder
-        };
-
         Request {
             path,
             builder,
             payload: None,
             config: &self.config,
             client: &self.client,
+            direct_access: false,
+            direct_access_range: None,
+            direct_access_if_none_match: false,
             idempotent: false,
         }
     }
@@ -472,13 +535,20 @@ impl SAPHdlfsClient {
             attributes: _,
             extensions,
         } = opts;
-        let builder = self
+        let mut builder = self
             .request(Method::PUT, location)
             .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
             .header(HDLFS_CONTENT_TYPE, HDLFS_BINARY)
             .query(&[("op", "CREATE"), ("data", "true")]) // Adds ?op=CREATE&data=true
             .with_payload(payload)
-            .with_extensions(extensions);
+            .with_extensions(extensions)
+            .accept_direct_access();
+
+        // Mirror HDLFS server-side put-if-absent semantics through the
+        // presigned URL when CREATE is delegated to direct access.
+        if let PutMode::Create = mode {
+            builder = builder.with_direct_access_if_none_match();
+        }
 
         match (mode, builder.do_put().await) {
             (PutMode::Create, Err(crate::Error::Precondition { path, source })) => {
@@ -1022,6 +1092,7 @@ impl GetClient for SAPHdlfsClient {
         // total = full size of the resource in bytes (or * if the total length is unknown)
 
         let mut content_range = String::new();
+        let mut da_range_inclusive: Option<(u64, u64)> = None;
         if let Some(range) = &options.range {
             let file_len = self.get_file_length(path).await?;
 
@@ -1030,12 +1101,14 @@ impl GetClient for SAPHdlfsClient {
                     let offset = r.start.to_string();
                     let length = (r.end - r.start).to_string();
                     content_range = format!("bytes {}-{}/{}", r.start, r.end - 1, file_len);
+                    da_range_inclusive = Some((r.start, r.end - 1));
                     parameters.push(("offset".to_owned(), offset));
                     parameters.push(("length".to_owned(), length));
                 }
                 GetRange::Offset(o) => {
                     let offset = o.to_string();
                     content_range = format!("bytes {}-/{}", offset, file_len);
+                    da_range_inclusive = Some((*o, file_len.saturating_sub(1)));
                     parameters.push(("offset".to_owned(), offset));
                 }
                 GetRange::Suffix(l) => {
@@ -1045,6 +1118,7 @@ impl GetClient for SAPHdlfsClient {
                     let offset = start.to_string();
                     let length = l.to_string();
                     content_range = format!("bytes {}-{}/{}", start, end - 1, file_len);
+                    da_range_inclusive = Some((start, end.saturating_sub(1)));
                     parameters.push(("offset".to_owned(), offset));
                     parameters.push(("length".to_owned(), length));
                 }
@@ -1052,12 +1126,15 @@ impl GetClient for SAPHdlfsClient {
         }
 
         // Build the request with required headers and query
-        let builder = self
+        let mut builder = self
             .request(method, path)
             .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
-            .query(&parameters);
+            .query(&parameters)
+            .accept_direct_access();
+        if let Some((s, e)) = da_range_inclusive {
+            builder = builder.with_direct_access_range(s, e);
+        }
 
-        let builder = builder;
         let response = builder.send().await;
 
         match response {
