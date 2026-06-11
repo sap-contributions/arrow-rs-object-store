@@ -86,6 +86,7 @@ pub struct SAPHdlfsBuilder {
     trace: crate::config::ConfigValue<bool>,
     endpoint: String,
     use_emulator: crate::config::ConfigValue<bool>,
+    direct_access: crate::config::ConfigValue<bool>,
     retry_config: RetryConfig,
     client_options: ClientOptions,
 }
@@ -99,6 +100,7 @@ impl Default for SAPHdlfsBuilder {
             trace: Default::default(),
             endpoint: Default::default(),
             use_emulator: Default::default(),
+            direct_access: Default::default(),
             retry_config: RetryConfig {
                 max_retries: 5,
                 ..Default::default()
@@ -154,6 +156,17 @@ pub enum SAPHdlfsConfigKey {
     /// - `trace`
     Trace,
 
+    /// Whether to opt into HDLFS direct-access (cloud-storage redirects).
+    /// When enabled, the client sends `X-SAP-Accept-Direct-Access: true` and
+    /// follows the returned object-store redirect for supported operations.
+    /// HDLFS may still serve the request through the namenode if direct
+    /// access is not available; the header is advisory, not required.
+    ///
+    /// Supported keys:
+    /// - `hdlfs_direct_access`
+    /// - `direct_access`
+    DirectAccess,
+
     /// Client options
     Client(crate::client::ClientConfigKey),
 }
@@ -167,6 +180,7 @@ impl AsRef<str> for crate::hdlfs::builder::SAPHdlfsConfigKey {
             Self::ContainerId => "hdlfs_container_id",
             Self::UseEmulator => "hdlfs_storage_use_emulator",
             Self::Trace => "hdlfs_storage_trace",
+            Self::DirectAccess => "hdlfs_direct_access",
             Self::Client(key) => key.as_ref(),
         }
     }
@@ -183,6 +197,7 @@ impl FromStr for SAPHdlfsConfigKey {
             "hdlfs_container_id" | "container_id" => Ok(Self::ContainerId),
             "hdlfs_storage_use_emulator" | "use_emulator" => Ok(Self::UseEmulator),
             "hdlfs_storage_trace" | "trace" => Ok(Self::Trace),
+            "hdlfs_direct_access" | "direct_access" => Ok(Self::DirectAccess),
             // Delegate to ClientConfigKey for client options
             other => {
                 if let Ok(client_key) = crate::client::ClientConfigKey::from_str(other) {
@@ -269,6 +284,11 @@ impl SAPHdlfsBuilder {
                     self.trace = val.into();
                 }
             }
+            SAPHdlfsConfigKey::DirectAccess => {
+                if let Ok(val) = value.parse::<bool>() {
+                    self.direct_access = val.into();
+                }
+            }
             SAPHdlfsConfigKey::Client(key) => {
                 self.client_options = self.client_options.with_config(key, value)
             }
@@ -291,6 +311,20 @@ impl SAPHdlfsBuilder {
     /// Sets whether to enable tracing for the client.
     pub fn with_trace(mut self, trace: bool) -> Self {
         self.trace = trace.into();
+        self
+    }
+
+    /// Opt into HDLFS direct-access redirects.
+    ///
+    /// When enabled, the client advertises support via the
+    /// `X-SAP-Accept-Direct-Access: true` request header. If the HDLFS server
+    /// chooses to serve a request directly from the underlying object store
+    /// (S3 / WASB / GCS), the client transparently follows the returned
+    /// redirect using the credentials supplied in the response. The header is
+    /// advisory: HDLFS may still serve the request through the namenode, in
+    /// which case the response is processed normally.
+    pub fn with_direct_access(mut self, direct_access: bool) -> Self {
+        self.direct_access = direct_access.into();
         self
     }
 
@@ -325,6 +359,7 @@ impl SAPHdlfsBuilder {
             SAPHdlfsConfigKey::ContainerId => Some(self.container_id.clone()),
             SAPHdlfsConfigKey::UseEmulator => Some(self.use_emulator.get().ok()?.to_string()),
             SAPHdlfsConfigKey::Trace => Some(self.trace.get().ok()?.to_string()),
+            SAPHdlfsConfigKey::DirectAccess => Some(self.direct_access.get().ok()?.to_string()),
             SAPHdlfsConfigKey::Client(key) => self.client_options.get_config_value(key),
         }
     }
@@ -391,6 +426,7 @@ impl SAPHdlfsBuilder {
         let options = ClientOptions::new().with_timeout(Duration::from_secs(60));
         let use_emulator = self.use_emulator.get()?;
         let trace = self.trace.get()?;
+        let direct_access = self.direct_access.get()?;
 
         if let Some(url) = self.url.take() {
             eprintln!("parse_url: {}", url);
@@ -442,6 +478,7 @@ impl SAPHdlfsBuilder {
             parsed_url,
             use_emulator,
             trace,
+            direct_access,
             retry_config,
             options,
         );
@@ -456,5 +493,46 @@ impl SAPHdlfsBuilder {
 impl Display for SAPHdlfsBuilder {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "HdlfsBuilder(endpoint={})", self.endpoint)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_access_config_key_roundtrip() {
+        for alias in ["direct_access", "hdlfs_direct_access"] {
+            let parsed: SAPHdlfsConfigKey = alias.parse().unwrap();
+            assert!(matches!(parsed, SAPHdlfsConfigKey::DirectAccess));
+        }
+        assert_eq!(
+            SAPHdlfsConfigKey::DirectAccess.as_ref(),
+            "hdlfs_direct_access"
+        );
+    }
+
+    #[test]
+    fn direct_access_defaults_to_false_and_can_be_enabled() {
+        let builder = SAPHdlfsBuilder::new();
+        assert_eq!(
+            builder.get_config_value(&SAPHdlfsConfigKey::DirectAccess),
+            Some("false".to_string())
+        );
+
+        let builder = builder.with_direct_access(true);
+        assert_eq!(
+            builder.get_config_value(&SAPHdlfsConfigKey::DirectAccess),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn direct_access_config_set_via_string() {
+        let builder = SAPHdlfsBuilder::new().with_config(SAPHdlfsConfigKey::DirectAccess, "true");
+        assert_eq!(
+            builder.get_config_value(&SAPHdlfsConfigKey::DirectAccess),
+            Some("true".to_string())
+        );
     }
 }

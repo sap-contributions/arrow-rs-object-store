@@ -33,7 +33,9 @@ use crate::{ListResult, ObjectMeta};
 use crate::{ClientOptions, Result, RetryConfig};
 
 use crate::client::HttpResponse;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::client::get::GetClient;
@@ -63,6 +65,13 @@ const HDLFS_FILE_CONTAINER: &str = "X-SAP-FileContainer";
 const HDLFS_CONTENT_TYPE: &str = "Content-Type";
 const HDLFS_BINARY: &str = "application/octet-stream";
 const HDLFS_JSON: &str = "application/json";
+
+/// Sent by the client to advertise that it can follow a direct-access
+/// redirect to the underlying object store.
+const ACCEPT_DIRECT_ACCESS_HEADER: &str = "X-SAP-Accept-Direct-Access";
+/// Returned by HDLFS when the response payload is a direct-access redirect
+/// (an `ObjectStoreRedirectResponse` JSON body) instead of file data.
+const DIRECT_ACCESS_HEADER: &str = "X-SAP-Direct-Access";
 
 const LIST_DLT_SUFFIX1: &str = "__list_delta_table_1__/";
 const LIST_DLT_SUFFIX2: &str = "__list_delta_table_2__/";
@@ -111,6 +120,38 @@ fn parse_direct_access_path(path_str: &str) -> Option<DirectAccessRequest> {
         });
     }
     None
+}
+
+/// Properties block returned inside a direct-access redirect response.
+///
+/// HDLFS responds with this JSON when the request advertised
+/// `X-SAP-Accept-Direct-Access: true` and the server elected to fulfil it
+/// directly from the underlying object store. The client must replay the
+/// request against `endpoint` using `method` and the supplied `headers`.
+#[derive(Deserialize, Debug)]
+struct DirectAccessProperties {
+    endpoint: String,
+    method: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct DirectAccessResponse {
+    properties: DirectAccessProperties,
+}
+
+/// Build an empty 502 Bad Gateway response.
+///
+/// Used when a direct-access descriptor returned by HDLFS cannot be parsed —
+/// surfacing a synthetic upstream error is safer than returning the
+/// (otherwise-empty) response and letting the caller treat it as success.
+fn empty_bad_gateway() -> HttpResponse {
+    http::Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(CONTENT_LENGTH, 0)
+        .body(HttpResponseBody::from(bytes::Bytes::new()))
+        .unwrap()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +218,10 @@ pub(crate) struct SAPHdlfsConfig {
     pub is_emulator: bool,
     #[allow(dead_code)]
     pub trace: bool,
+    /// Opt-in: send `X-SAP-Accept-Direct-Access: true` with each request and
+    /// transparently follow direct-access redirects when the server returns
+    /// them. Not strict: server may still respond through the namenode.
+    pub direct_access: bool,
     #[allow(dead_code)]
     pub client_options: ClientOptions,
 }
@@ -194,6 +239,7 @@ impl SAPHdlfsConfig {
         service: Url,
         is_emulator: bool,
         trace: bool,
+        direct_access: bool,
         retry_config: RetryConfig,
         client_options: ClientOptions,
     ) -> Self {
@@ -203,6 +249,7 @@ impl SAPHdlfsConfig {
             service,
             is_emulator,
             trace,
+            direct_access,
             client_options,
         }
     }
@@ -213,6 +260,7 @@ impl SAPHdlfsConfig {
 pub(crate) struct Request<'a> {
     path: &'a Path,
     config: &'a SAPHdlfsConfig,
+    client: &'a HttpClient,
     payload: Option<PutPayload>,
     builder: HttpRequestBuilder,
     #[allow(dead_code)]
@@ -251,9 +299,60 @@ impl Request<'_> {
     }
 
     async fn send(self) -> Result<HttpResponse, crate::client::retry::RetryError> {
-        self.builder
+        let direct_access = self.config.direct_access;
+        let payload = self.payload.clone();
+        let response = self
+            .builder
             .retryable(&self.config.retry_config)
             .payload(self.payload)
+            .send()
+            .await?;
+
+        if !direct_access {
+            return Ok(response);
+        }
+
+        if response
+            .headers()
+            .get(DIRECT_ACCESS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            != Some(true)
+        {
+            return Ok(response);
+        }
+
+        // Server elected to serve this request directly from the underlying
+        // object store. The body is a JSON descriptor; replay the request
+        // against the supplied endpoint with the supplied headers/method.
+        let body = match response.into_body().bytes().await {
+            Ok(b) => b,
+            // Cannot read redirect descriptor — surface a synthetic 502 so
+            // the caller does not interpret an empty body as success.
+            Err(_) => return Ok(empty_bad_gateway()),
+        };
+
+        let descriptor: DirectAccessResponse = match serde_json::from_slice(&body) {
+            Ok(d) => d,
+            Err(_) => return Ok(empty_bad_gateway()),
+        };
+
+        let method = match Method::from_str(&descriptor.properties.method) {
+            Ok(m) => m,
+            Err(_) => return Ok(empty_bad_gateway()),
+        };
+
+        // The presigned URL is auth-bearing; it does not need the HDLFS
+        // client certificate, container header, or accept-direct-access
+        // header. Send it as a fresh request.
+        let mut redirect = self.client.request(method, descriptor.properties.endpoint);
+        for (key, value) in descriptor.properties.headers {
+            redirect = redirect.header(key.as_str(), value.as_str());
+        }
+
+        redirect
+            .retryable(&self.config.retry_config)
+            .payload(payload)
             .send()
             .await
     }
@@ -310,11 +409,18 @@ impl SAPHdlfsClient {
         let uri = self.object_url(path);
         let builder = self.client.request(method, uri);
 
+        let builder = if self.config.direct_access {
+            builder.header(ACCEPT_DIRECT_ACCESS_HEADER, "true")
+        } else {
+            builder
+        };
+
         Request {
             path,
             builder,
             payload: None,
             config: &self.config,
+            client: &self.client,
             idempotent: false,
         }
     }
@@ -1133,5 +1239,48 @@ impl ListClient for Arc<SAPHdlfsClient> {
             },
             page_token: None, // HDLFS does not support pagination, so we return None for next page token
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_direct_access_descriptor() {
+        let json = r#"{
+            "properties": {
+                "endpoint": "https://bucket.s3.amazonaws.com/key?X-Amz-Signature=...",
+                "method": "GET",
+                "headers": {
+                    "x-amz-server-side-encryption": "AES256"
+                }
+            }
+        }"#;
+
+        let descriptor: DirectAccessResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(descriptor.properties.method, "GET");
+        assert!(descriptor.properties.endpoint.contains("X-Amz-Signature"));
+        assert_eq!(
+            descriptor
+                .properties
+                .headers
+                .get("x-amz-server-side-encryption")
+                .map(String::as_str),
+            Some("AES256")
+        );
+    }
+
+    #[test]
+    fn descriptor_headers_default_to_empty() {
+        let json = r#"{
+            "properties": {
+                "endpoint": "https://example.invalid/path",
+                "method": "PUT"
+            }
+        }"#;
+
+        let descriptor: DirectAccessResponse = serde_json::from_str(json).unwrap();
+        assert!(descriptor.properties.headers.is_empty());
     }
 }
