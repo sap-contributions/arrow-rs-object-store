@@ -146,6 +146,23 @@ fn empty_bad_gateway() -> HttpResponse {
         .unwrap()
 }
 
+/// HDLFS reports an existing file on `CREATE&overwrite=false` with a
+/// 403 response whose body carries `FileAlreadyExistsException`.
+fn hdlfs_already_exists(source: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let mut current: Option<&dyn std::error::Error> = Some(source);
+    while let Some(err) = current {
+        let msg = err.to_string();
+        if msg.contains("FileAlreadyExistsException")
+            || msg.contains("AlreadyExists")
+            || msg.contains("already exists")
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     // ... other variants ...
@@ -333,13 +350,14 @@ impl Request<'_> {
             return Ok(response);
         }
 
-        if response
-            .headers()
-            .get(DIRECT_ACCESS_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            != Some(true)
-        {
+        let is_direct_access = response.status().is_success()
+            && response
+                .headers()
+                .get(DIRECT_ACCESS_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                == Some(true);
+        if !is_direct_access {
             return Ok(response);
         }
 
@@ -517,6 +535,11 @@ impl SAPHdlfsClient {
 
         match (mode, builder.do_put().await) {
             (PutMode::Create, Err(crate::Error::Precondition { path, source })) => {
+                Err(crate::Error::AlreadyExists { path, source })
+            }
+            (PutMode::Create, Err(crate::Error::PermissionDenied { path, source }))
+                if hdlfs_already_exists(source.as_ref()) =>
+            {
                 Err(crate::Error::AlreadyExists { path, source })
             }
             (_, r) => r,
@@ -1324,5 +1347,23 @@ mod tests {
 
         let descriptor: DirectAccessResponse = serde_json::from_str(json).unwrap();
         assert!(descriptor.properties.headers.is_empty());
+    }
+
+    #[test]
+    fn already_exists_matches_hdlfs_body() {
+        #[derive(Debug)]
+        struct Err(&'static str);
+        impl std::fmt::Display for Err {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for Err {}
+
+        assert!(hdlfs_already_exists(&Err(
+            "Server returned non-2xx: 403: org.apache.hadoop.fs.FileAlreadyExistsException: ..."
+        )));
+        assert!(hdlfs_already_exists(&Err("file already exists at /foo")));
+        assert!(!hdlfs_already_exists(&Err("Forbidden: not authorized")));
     }
 }
