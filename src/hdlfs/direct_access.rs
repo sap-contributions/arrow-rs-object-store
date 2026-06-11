@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use http::header::CONTENT_LENGTH;
 use hyper::Method;
 use serde::Deserialize;
 
@@ -79,6 +80,9 @@ pub(crate) async fn follow(
     for (key, value) in descriptor.properties.headers {
         redirect = redirect.header(key.as_str(), value.as_str());
     }
+    if let Some(ref p) = payload {
+        redirect = redirect.header(CONTENT_LENGTH, p.content_length());
+    }
     if let Some((start, end_inclusive)) = opts.range {
         redirect = redirect.header("Range", &format!("bytes={start}-{end_inclusive}"));
     }
@@ -91,10 +95,7 @@ pub(crate) async fn follow(
         .payload(payload)
         .send()
         .await
-        .map_err(|source| crate::Error::Generic {
-            store: STORE,
-            source: Box::new(source),
-        })
+        .map_err(|source| source.error(STORE, String::new()))
 }
 
 /// HDLFS error envelope returned when a `RemoteException` is raised.

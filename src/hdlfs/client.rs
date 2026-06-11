@@ -392,11 +392,16 @@ impl SAPHdlfsClient {
             attributes: _,
             extensions,
         } = opts;
+        let overwrite = !matches!(mode, PutMode::Create);
         let mut builder = self
             .request(Method::PUT, location)
             .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
             .header(HDLFS_CONTENT_TYPE, HDLFS_BINARY)
-            .query(&[("op", "CREATE"), ("data", "true")]) // Adds ?op=CREATE&data=true
+            .query(&[
+                ("op", "CREATE"),
+                ("data", "true"),
+                ("overwrite", if overwrite { "true" } else { "false" }),
+            ])
             .with_payload(payload.clone())
             .with_extensions(extensions);
         if self.config.direct_access {
