@@ -1041,6 +1041,7 @@ mod tests {
     use hyper::Request;
     use hyper::body::Incoming;
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_create_multipart_has_content_length() {
         let mock = MockServer::new().await;
@@ -1138,6 +1139,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_default_headers_signed_request() {
         let mock = MockServer::new().await;
@@ -1162,6 +1164,7 @@ mod tests {
         mock.shutdown().await;
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_default_headers_signed_bulk_delete() {
         let mock = MockServer::new().await;
@@ -1338,6 +1341,7 @@ mod tests {
         mock.shutdown().await;
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_default_headers_signed_get_request() {
         let mock = MockServer::new().await;
@@ -1360,6 +1364,7 @@ mod tests {
         mock.shutdown().await;
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_default_headers_signed_complete_multipart() {
         let mock = MockServer::new().await;
