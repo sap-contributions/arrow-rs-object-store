@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use crate::client::get::GetClient;
 use crate::client::list::ListClient;
+use crate::hdlfs::direct_access;
 use crate::hdlfs::filestatus::FileStatusResponse;
 use crate::hdlfs::list::{
     BatchDeleteWrapper, DeleteFile, DirectoryListing, MergeSource, MergeSourcesWrapper,
@@ -167,6 +168,27 @@ impl From<Error> for crate::Error {
     }
 }
 
+fn map_put_error(
+    location: &Path,
+    mode: PutMode,
+    source: crate::client::retry::RetryError,
+) -> crate::Error {
+    use http::StatusCode;
+    let path = location.as_ref().to_string();
+    if matches!(mode, PutMode::Create) {
+        let already_exists = source.status() == Some(StatusCode::CONFLICT)
+            || source.status() == Some(StatusCode::PRECONDITION_FAILED)
+            || source.body().is_some_and(direct_access::is_already_exists);
+        if already_exists {
+            return crate::Error::AlreadyExists {
+                path,
+                source: Box::new(source),
+            };
+        }
+    }
+    Error::Request { source, path }.into()
+}
+
 /// SAP HANA Cloud, Data Lake Files (hdlfs) client configuration
 #[derive(Debug, Clone)]
 pub(crate) struct SAPHdlfsConfig {
@@ -177,6 +199,8 @@ pub(crate) struct SAPHdlfsConfig {
     pub is_emulator: bool,
     #[allow(dead_code)]
     pub trace: bool,
+    /// Opt into direct-access redirects.
+    pub direct_access: bool,
     #[allow(dead_code)]
     pub client_options: ClientOptions,
 }
@@ -194,6 +218,7 @@ impl SAPHdlfsConfig {
         service: Url,
         is_emulator: bool,
         trace: bool,
+        direct_access: bool,
         retry_config: RetryConfig,
         client_options: ClientOptions,
     ) -> Self {
@@ -203,6 +228,7 @@ impl SAPHdlfsConfig {
             service,
             is_emulator,
             trace,
+            direct_access,
             client_options,
         }
     }
@@ -366,20 +392,66 @@ impl SAPHdlfsClient {
             attributes: _,
             extensions,
         } = opts;
-        let builder = self
+        let overwrite = !matches!(mode, PutMode::Create);
+        let mut builder = self
             .request(Method::PUT, location)
             .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
             .header(HDLFS_CONTENT_TYPE, HDLFS_BINARY)
-            .query(&[("op", "CREATE"), ("data", "true")]) // Adds ?op=CREATE&data=true
-            .with_payload(payload)
+            .query(&[
+                ("op", "CREATE"),
+                ("data", "true"),
+                ("overwrite", if overwrite { "true" } else { "false" }),
+            ])
+            .with_payload(payload.clone())
             .with_extensions(extensions);
-
-        match (mode, builder.do_put().await) {
-            (PutMode::Create, Err(crate::Error::Precondition { path, source })) => {
-                Err(crate::Error::AlreadyExists { path, source })
-            }
-            (_, r) => r,
+        if self.config.direct_access {
+            builder = builder.header(direct_access::ACCEPT_HEADER, "true");
         }
+
+        let path_str = location.as_ref().to_string();
+        let response = match builder.send().await {
+            Ok(r) => r,
+            Err(source) => {
+                return Err(map_put_error(location, mode, source));
+            }
+        };
+
+        let response = if direct_access::is_redirect(&response) {
+            direct_access::follow(
+                &self.client,
+                &self.config.retry_config,
+                response,
+                Some(payload),
+                direct_access::ReplayOptions {
+                    if_none_match: matches!(mode, PutMode::Create),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| match e {
+                crate::Error::Precondition { source, .. } if matches!(mode, PutMode::Create) => {
+                    crate::Error::AlreadyExists {
+                        path: path_str.clone(),
+                        source,
+                    }
+                }
+                other => other,
+            })?
+        } else {
+            response
+        };
+
+        let e_tag = response
+            .headers()
+            .get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // HDLFS does not provide version or etag in headers, so return default PutResult
+        Ok(PutResult {
+            e_tag,
+            version: None,
+        })
     }
 
     pub(crate) async fn put_block(
@@ -916,6 +988,7 @@ impl GetClient for SAPHdlfsClient {
         // total = full size of the resource in bytes (or * if the total length is unknown)
 
         let mut content_range = String::new();
+        let mut da_range_inclusive: Option<(u64, u64)> = None;
         if let Some(range) = &options.range {
             let file_len = self.get_file_length(path).await?;
 
@@ -924,12 +997,14 @@ impl GetClient for SAPHdlfsClient {
                     let offset = r.start.to_string();
                     let length = (r.end - r.start).to_string();
                     content_range = format!("bytes {}-{}/{}", r.start, r.end - 1, file_len);
+                    da_range_inclusive = Some((r.start, r.end - 1));
                     parameters.push(("offset".to_owned(), offset));
                     parameters.push(("length".to_owned(), length));
                 }
                 GetRange::Offset(o) => {
                     let offset = o.to_string();
                     content_range = format!("bytes {}-/{}", offset, file_len);
+                    da_range_inclusive = Some((*o, file_len.saturating_sub(1)));
                     parameters.push(("offset".to_owned(), offset));
                 }
                 GetRange::Suffix(l) => {
@@ -939,6 +1014,7 @@ impl GetClient for SAPHdlfsClient {
                     let offset = start.to_string();
                     let length = l.to_string();
                     content_range = format!("bytes {}-{}/{}", start, end - 1, file_len);
+                    da_range_inclusive = Some((start, end.saturating_sub(1)));
                     parameters.push(("offset".to_owned(), offset));
                     parameters.push(("length".to_owned(), length));
                 }
@@ -946,16 +1022,33 @@ impl GetClient for SAPHdlfsClient {
         }
 
         // Build the request with required headers and query
-        let builder = self
+        let mut builder = self
             .request(method, path)
             .header(HDLFS_FILE_CONTAINER, &self.config.container_id)
             .query(&parameters);
+        if self.config.direct_access {
+            builder = builder.header(direct_access::ACCEPT_HEADER, "true");
+        }
 
-        let builder = builder;
         let response = builder.send().await;
 
         match response {
             Ok(resp) => {
+                let resp = if direct_access::is_redirect(&resp) {
+                    direct_access::follow(
+                        &self.client,
+                        &self.config.retry_config,
+                        resp,
+                        None,
+                        direct_access::ReplayOptions {
+                            range: da_range_inclusive,
+                            ..Default::default()
+                        },
+                    )
+                    .await?
+                } else {
+                    resp
+                };
                 if options.range.is_some() {
                     let (mut parts, body) = self.handle_chunked_response(resp, path).await?;
                     parts
@@ -1133,5 +1226,17 @@ impl ListClient for Arc<SAPHdlfsClient> {
             },
             page_token: None, // HDLFS does not support pagination, so we return None for next page token
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn already_exists_recognised() {
+        assert!(direct_access::is_already_exists(
+            r#"{"RemoteException":{"exception":"FileAlreadyExistsException"}}"#
+        ));
     }
 }

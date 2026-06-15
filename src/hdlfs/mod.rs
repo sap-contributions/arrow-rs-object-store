@@ -39,6 +39,7 @@ use std::sync::Arc;
 mod builder;
 mod client;
 mod credential;
+mod direct_access;
 
 mod list;
 
