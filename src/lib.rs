@@ -521,39 +521,43 @@
 //!
 //! # Feature Flags
 //!
-//! The feature set is layered so that you can pick a provider independently
-//! of its HTTP transport:
+//! The feature set is layered so that you can pick an object store
+//! implementation, its HTTP transport, and its cryptography provider
+//! independently:
 //!
-//! * `cloud-base` holds the shared provider implementation (XML/JSON parsing,
+//! * `cloud-base` shared cloud implementation (XML/JSON parsing,
 //!   credentials, retry, etc.) and intentionally does *not* depend on
-//!   `reqwest`.
+//!   `reqwest` or a cryptography provider.
 //! * `reqwest` enables the built-in [`reqwest`]-based [`HttpConnector`].
+//! * `aws-lc-rs` and `ring` each provide a bundled [`client::CryptoProvider`].
 //! * `<provider>-base` (`aws-base`, `azure-base`, `gcp-base`, `http-base`)
-//!   adds the per-provider logic on top of `cloud-base` without pulling in
-//!   `reqwest`.
+//!   adds the implementation specific logic on top of `cloud-base` without pulling in
+//!   `reqwest` or a cryptography provider.
 //! * `<provider>` (`aws`, `azure`, `gcp`, `http`) is the batteries-included
-//!   alias for `<provider>-base` + `reqwest` and is the typical choice.
+//!   feature for `<provider>-base` + `reqwest` (with `rustls`) + the default
+//!   `aws-lc-rs` cryptography provider, and is the typical choice.
 //!
-//! ## Provider features
+//! ## Implementation specific features
 //!
 //! | Feature | Enables | Notes |
 //! | --- | --- | --- |
-//! | `aws` | `aws-base` + `reqwest` | Amazon S3 with the built-in HTTP transport. |
-//! | `azure` | `azure-base` + `reqwest` | Azure Blob Storage with the built-in HTTP transport. |
-//! | `gcp` | `gcp-base` + `reqwest` | Google Cloud Storage with the built-in HTTP transport. |
-//! | `http` | `http-base` + `reqwest` | HTTP/WebDAV with the built-in HTTP transport. |
-//! | `aws-base` | provider only | S3 provider without `reqwest`; supply your own [`HttpConnector`]. |
-//! | `azure-base` | provider only | Azure provider without `reqwest`; supply your own [`HttpConnector`]. |
-//! | `gcp-base` | provider only | GCS provider without `reqwest`; supply your own [`HttpConnector`]. |
-//! | `http-base` | provider only | HTTP/WebDAV provider without `reqwest`; supply your own [`HttpConnector`]. |
+//! | `aws` | `aws-base` + `reqwest` + `aws-lc-rs` | Amazon S3 with the built-in HTTP transport. |
+//! | `azure` | `azure-base` + `reqwest` + `aws-lc-rs` | Azure Blob Storage with the built-in HTTP transport. |
+//! | `gcp` | `gcp-base` + `reqwest` + `aws-lc-rs` | Google Cloud Storage with the built-in HTTP transport. |
+//! | `http` | `http-base` + `reqwest` + `aws-lc-rs` | HTTP/WebDAV with the built-in HTTP transport. |
+//! | `aws-base` |  | S3 without `reqwest` or crypto; supply your own [`HttpConnector`] and [`client::CryptoProvider`]. |
+//! | `azure-base` |  | Azure without `reqwest` or crypto; supply your own [`HttpConnector`] and [`client::CryptoProvider`]. |
+//! | `gcp-base` |  | GCS without `reqwest` or crypto; supply your own [`HttpConnector`] and [`client::CryptoProvider`]. |
+//! | `http-base` |  | HTTP/WebDAV without `reqwest`; supply your own [`HttpConnector`]. |
 //!
-//! ## Transport and shared features
+//! ## Transport and crypto features
 //!
 //! | Feature | Description |
 //! | --- | --- |
-//! | `reqwest` | Enables the default [`reqwest`]-based [`HttpConnector`]. Pulled in automatically by `aws`, `azure`, `gcp`, and `http`. |
-//! | `tls-webpki-roots` | When `reqwest` is enabled, also bundle Mozilla's [`webpki-roots`] CA certificates. See [TLS Certificates](#tls-certificates). |
-//! | `cloud-base` | Shared cloud-provider implementation. Pulled in automatically by every `*-base` feature; usually not enabled directly. |
+//! | `reqwest` | Enables the [`reqwest`]-based [`HttpConnector`]. Enabled automatically by `aws`, `azure`, `gcp`, and `http`. |
+//! | `aws-lc-rs` | Bundled [`aws-lc-rs`]-based [`client::CryptoProvider`]. The default for the batteries-included provider features. |
+//! | `ring` | Bundled [`ring`]-based [`client::CryptoProvider`], e.g. for WASM targets. |
+//! | `cloud-base` | Shared cloud-provider implementation. Enabled automatically by `*-base` features; usually not enabled directly. |
 //!
 //! ## Other features
 //!
@@ -563,15 +567,85 @@
 //! | `tokio` | Enables Tokio-based utilities such as [`BufReader`](buffered::BufReader) and [`BufWriter`](buffered::BufWriter). Pulled in automatically by `fs` and the `*-base` features. |
 //! | `integration` | Exposes the [`integration`] module, a reusable test suite for verifying custom [`ObjectStore`] implementations. Not API-stable. |
 //!
+//! ## Selecting a `reqwest` TLS backend
+//!
+//! `reqwest` needs a TLS backend to compile, so whenever you enable the `reqwest` feature directly
+//! you must also enable one of `reqwest`'s TLS features:
+//!
+//! | reqwest feature | TLS stack | Notes |
+//! | --- | --- | --- |
+//! | `reqwest/rustls` | [rustls] with [`aws-lc-rs`] | enables `aws-lc-rs`. This is what `aws`/`azure`/`gcp`/`http` enable. |
+//! | `reqwest/native-tls` | the platform's native TLS (OpenSSL / SChannel / Secure Transport) | enables neither `rustls` nor `aws-lc-rs`. |
+//! | `reqwest/rustls-no-provider` | [rustls] with no bundled provider | enables neither provider; you must install one at runtime, e.g. `rustls::crypto::ring::default_provider().install_default()`. |
+//!
+//! ## Feature examples
+//!
+//! S3 implementation only; user provides the HTTP connector and crypto provider:
+//! ```toml
+//! object_store = { default-features = false, features = ["aws-base"] }
+//! ```
+//!
+//! S3 implementation + `reqwest` + `aws-lc-rs` signing (equivalent to the `aws` feature):
+//! ```toml
+//! object_store = { default-features = false, features = ["aws-base", "reqwest", "reqwest/rustls", "aws-lc-rs"] }
+//! ```
+//!
+//! S3 implementation + `reqwest` with native TLS + `ring` signing (no `aws-lc-rs` in the dependency tree):
+//! ```toml
+//! object_store = { default-features = false, features = ["aws-base", "reqwest", "reqwest/native-tls", "ring"] }
+//! ```
+//!
+//! [rustls]: https://crates.io/crates/rustls/
+//!
+//! # Cryptography
+//!
+//! Request signing (e.g. AWS SigV4 or GCP service-account signing) requires a
+//! [`client::CryptoProvider`]. The `aws`, `gcp`, and `azure` features
+//! use [`aws-lc-rs`], matching `reqwest`'s default so that applications do not end up with
+//! two crypto stacks.
+//!
+//! If you wish to use [`ring`] (e.g. to support WASM targets), use the
+//! `*-base` feature flags, e.g. `aws-base`, and then enable the `ring` feature.
+//!
+//! If both `ring` and `aws-lc-rs` are enabled, `aws-lc-rs` is used by default.
+//!
+//! You can also implement a custom [`client::CryptoProvider`] to use your own cryptographic library.
+//!
+//! This signing provider is independent of the TLS crypto provider used by the
+//! built-in `reqwest` transport — see
+//! [Selecting a `reqwest` TLS backend](#selecting-a-reqwest-tls-backend). The
+//! only combination that needs the provider registered manually (e.g.
+//! `rustls::crypto::ring::default_provider().install_default()` in your `main`)
+//! is `reqwest/rustls-no-provider`; `reqwest/rustls` and `reqwest/native-tls`
+//! configure their TLS stack automatically.
+//!
+//! [`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs/
+//! [`ring`]: https://crates.io/crates/ring/
+//!
 //! # TLS Certificates
 //!
-//! Stores that use HTTPS/TLS (this is true for most cloud stores) can choose the source of their [CA]
-//! certificates. By default the system-bundled certificates are used (see
-//! [`rustls-native-certs`]). The `tls-webpki-roots` feature switch can be used to also bundle Mozilla's
-//! root certificates with the library/application (see [`webpki-roots`]).
+//! Stores that use HTTPS/TLS (this is true for most cloud stores) can choose how certificates are validated.
+//!
+//! By default [`rustls-platform-verifier`] is used to verify certificates using the system's certificate
+//! facilities. Alternatively, this functionality can be disabled using
+//! [`ClientOptions::with_no_system_certificates`] and certificates manually registered using
+//! [`ClientOptions::with_root_certificate`].
+//!
+//! These could be a custom CA chain, or alternatively an alternative trust store, e.g. [`webpki-roots`].
+//!
+//! ```ignore-wasm32
+//! # #[cfg(feature = "aws")] {
+//! use object_store::{ClientOptions, Certificate};
+//!
+//! let mut options = ClientOptions::default().with_no_system_certificates(true);
+//! for root_cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+//!     options = options.with_root_certificate(Certificate::from_der(root_cert.as_ref()).unwrap());
+//! }
+//! # }
+//! ```
 //!
 //! [CA]: https://en.wikipedia.org/wiki/Certificate_authority
-//! [`rustls-native-certs`]: https://crates.io/crates/rustls-native-certs/
+//! [`rustls-platform-verifier`]: https://crates.io/crates/rustls-platform-verifier/
 //! [`webpki-roots`]: https://crates.io/crates/webpki-roots
 //!
 //! # Customizing HTTP Clients

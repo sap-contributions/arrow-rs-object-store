@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Generic utilities for [`reqwest`] based [`ObjectStore`] implementations
+//! Generic utilities for network based [`ObjectStore`] implementations
 //!
 //! [`ObjectStore`]: crate::ObjectStore
 
@@ -52,6 +52,12 @@ mod http;
 #[cfg(any(feature = "aws-base", feature = "gcp-base", feature = "azure-base"))]
 pub(crate) mod parts;
 pub use http::*;
+
+#[cfg(any(feature = "aws-base", feature = "gcp-base", feature = "azure-base"))]
+mod crypto;
+
+#[cfg(any(feature = "aws-base", feature = "gcp-base", feature = "azure-base"))]
+pub use crypto::*;
 
 use ::http::header::{HeaderMap, HeaderValue};
 use async_trait::async_trait;
@@ -105,6 +111,14 @@ pub enum ClientConfigKey {
     /// Supported keys:
     /// - `allow_invalid_certificates`
     AllowInvalidCertificates,
+    /// Disable certificate validation using the operating system's certificate facilities.
+    ///
+    /// See [`ClientOptions::with_no_system_certificates`]
+    ///
+    /// Supported keys:
+    ///
+    /// - `disable_system_certificates`
+    NoSystemCertificates,
     /// Timeout for only the connect phase of a Client
     ///
     /// Supported keys:
@@ -216,6 +230,7 @@ impl AsRef<str> for ClientConfigKey {
         match self {
             Self::AllowHttp => "allow_http",
             Self::AllowInvalidCertificates => "allow_invalid_certificates",
+            Self::NoSystemCertificates => "disable_system_certificates",
             Self::ConnectTimeout => "connect_timeout",
             Self::DefaultContentType => "default_content_type",
             Self::Http1Only => "http1_only",
@@ -244,6 +259,7 @@ impl FromStr for ClientConfigKey {
         match s {
             "allow_http" => Ok(Self::AllowHttp),
             "allow_invalid_certificates" => Ok(Self::AllowInvalidCertificates),
+            "disable_system_certificates" => Ok(Self::NoSystemCertificates),
             "connect_timeout" => Ok(Self::ConnectTimeout),
             "default_content_type" => Ok(Self::DefaultContentType),
             "http1_only" => Ok(Self::Http1Only),
@@ -326,6 +342,7 @@ pub struct ClientOptions {
     user_agent: Option<ConfigValue<HeaderValue>>,
     #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
     root_certificates: Vec<Certificate>,
+    no_system_certificates: ConfigValue<bool>,
     content_type_map: HashMap<String, String>,
     default_content_type: Option<String>,
     default_headers: Option<HeaderMap>,
@@ -361,6 +378,7 @@ impl Default for ClientOptions {
             user_agent: None,
             #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
             root_certificates: Default::default(),
+            no_system_certificates: false.into(),
             content_type_map: Default::default(),
             default_content_type: None,
             default_headers: None,
@@ -401,6 +419,7 @@ impl ClientOptions {
             ClientConfigKey::AllowInvalidCertificates => {
                 self.allow_invalid_certificates.parse(value)
             }
+            ClientConfigKey::NoSystemCertificates => self.no_system_certificates.parse(value),
             ClientConfigKey::ConnectTimeout => {
                 self.connect_timeout = Some(ConfigValue::Deferred(value.into()))
             }
@@ -449,6 +468,7 @@ impl ClientOptions {
             ClientConfigKey::AllowInvalidCertificates => {
                 Some(self.allow_invalid_certificates.to_string())
             }
+            ClientConfigKey::NoSystemCertificates => Some(self.no_system_certificates.to_string()),
             ClientConfigKey::ConnectTimeout => self.connect_timeout.as_ref().map(fmt_duration),
             ClientConfigKey::ReadTimeout => self.read_timeout.as_ref().map(fmt_duration),
             ClientConfigKey::DefaultContentType => self.default_content_type.clone(),
@@ -532,6 +552,7 @@ impl ClientOptions {
         self.allow_http = allow_http.into();
         self
     }
+
     /// Allows connections to invalid SSL certificates
     ///
     /// If `allow_invalid_certificates` is :
@@ -551,6 +572,20 @@ impl ClientOptions {
     /// </div>
     pub fn with_allow_invalid_certificates(mut self, allow_invalid_certificates: bool) -> Self {
         self.allow_invalid_certificates = allow_invalid_certificates.into();
+        self
+    }
+
+    /// Disable certificates provided by the system
+    ///
+    /// By default TLS certificates are validated using [`rustls-platform-verifier`],
+    /// which makes use of the system's trust store, in addition to any certificates
+    /// registered using [`Self::with_root_certificate`]. If disabled, instead [`rustls-webpki`]
+    /// is used with only the certificates registered using [`Self::with_root_certificate`].
+    ///
+    /// [`rustls-platform-verifier`]: https://crates.io/crates/rustls-platform-verifier
+    /// [`rustls-webpki`]: https://crates.io/crates/rustls-webpki
+    pub fn with_no_system_certificates(mut self, no_certs: bool) -> Self {
+        self.no_system_certificates = no_certs.into();
         self
     }
 
@@ -816,7 +851,7 @@ impl ClientOptions {
                 let certificate = reqwest::tls::Certificate::from_pem(certificate.as_bytes())
                     .map_err(map_client_error)?;
 
-                builder = builder.add_root_certificate(certificate);
+                builder = builder.tls_certs_merge(std::iter::once(certificate));
             }
 
             if let Some(proxy_excludes) = &self.proxy_excludes {
@@ -828,8 +863,15 @@ impl ClientOptions {
             builder = builder.proxy(proxy);
         }
 
-        for certificate in &self.root_certificates {
-            builder = builder.add_root_certificate(certificate.0.clone());
+        let certs = self
+            .root_certificates
+            .iter()
+            .map(|certificate| certificate.0.clone());
+
+        if self.no_system_certificates.get()? {
+            builder = builder.tls_certs_only(certs);
+        } else {
+            builder = builder.tls_certs_merge(certs);
         }
 
         if let Some(timeout) = &self.timeout {
@@ -1073,6 +1115,7 @@ mod tests {
         let http2_keep_alive_timeout = "91 seconds".to_string();
         let http2_keep_alive_while_idle = "92 seconds".to_string();
         let http2_max_frame_size = "1337".to_string();
+        let no_system_certificates = "true".to_string();
         let pool_idle_timeout = "93 seconds".to_string();
         let pool_max_idle_per_host = "94".to_string();
         let proxy_url = "https://fake_proxy_url".to_string();
@@ -1100,6 +1143,10 @@ mod tests {
                 http2_keep_alive_while_idle.clone(),
             ),
             ("http2_max_frame_size", http2_max_frame_size.clone()),
+            (
+                "disable_system_certificates",
+                no_system_certificates.clone(),
+            ),
             ("pool_idle_timeout", pool_idle_timeout.clone()),
             ("pool_max_idle_per_host", pool_max_idle_per_host.clone()),
             ("proxy_url", proxy_url.clone()),
@@ -1173,6 +1220,12 @@ mod tests {
                 .get_config_value(&ClientConfigKey::Http2MaxFrameSize)
                 .unwrap(),
             http2_max_frame_size
+        );
+        assert_eq!(
+            builder
+                .get_config_value(&ClientConfigKey::NoSystemCertificates)
+                .unwrap(),
+            no_system_certificates
         );
 
         assert_eq!(

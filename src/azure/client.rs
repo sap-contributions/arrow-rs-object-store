@@ -23,7 +23,10 @@ use crate::client::get::GetClient;
 use crate::client::header::{HeaderConfig, get_put_result};
 use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
-use crate::client::{GetOptionsExt, HttpClient, HttpError, HttpRequest, HttpResponse};
+use crate::client::{
+    CryptoProvider, DigestAlgorithm, GetOptionsExt, HttpClient, HttpError, HttpRequest,
+    HttpResponse, crypto_provider,
+};
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
 use crate::util::{GetRange, deserialize_rfc1123};
@@ -41,7 +44,6 @@ use http::{
     header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, IF_MATCH, IF_NONE_MATCH},
 };
 use rand::RngExt;
-use ring::digest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -180,6 +182,7 @@ impl From<Error> for crate::Error {
 pub(crate) struct AzureConfig {
     pub account: String,
     pub container: String,
+    pub crypto: Option<Arc<dyn CryptoProvider>>,
     pub credentials: AzureCredentialProvider,
     pub retry_config: RetryConfig,
     pub service: Url,
@@ -250,7 +253,10 @@ impl std::fmt::Debug for AzureEncryptionHeaders {
 }
 
 impl AzureEncryptionHeaders {
-    pub(crate) fn try_new(encryption_key: Option<String>) -> Result<Self> {
+    pub(crate) fn try_new(
+        crypto: Option<&dyn CryptoProvider>,
+        encryption_key: Option<String>,
+    ) -> Result<Self> {
         let Some(encryption_key) = encryption_key else {
             return Ok(Self::default());
         };
@@ -275,8 +281,10 @@ impl AzureEncryptionHeaders {
             });
         }
 
-        let encryption_key_sha256 =
-            BASE64_STANDARD.encode(digest::digest(&digest::SHA256, &decoded_key));
+        let crypto = crypto_provider(crypto)?;
+        let mut ctx = crypto.digest(DigestAlgorithm::Sha256)?;
+        ctx.update(&decoded_key);
+        let encryption_key_sha256 = BASE64_STANDARD.encode(ctx.finish()?);
 
         Ok(Self {
             encryption_key: Some(encryption_key),
@@ -416,11 +424,12 @@ impl PutRequest<'_> {
     async fn send(self) -> Result<HttpResponse> {
         let credential = self.config.get_credential().await?;
         let sensitive = self.config.is_sensitive(&credential);
+        let crypto = self.config.crypto.as_deref();
         let response = self
             .builder
             .with_azure_encryption_headers(&self.config.encryption_headers)
             .header(CONTENT_LENGTH, self.payload.content_length())
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(crypto, &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .idempotent(self.idempotent)
@@ -674,6 +683,10 @@ impl AzureClient {
         self.config.get_credential().await
     }
 
+    pub(crate) fn crypto(&self) -> Option<&dyn CryptoProvider> {
+        self.config.crypto.as_deref()
+    }
+
     fn put_request<'a>(&'a self, path: &'a Path, payload: PutPayload) -> PutRequest<'a> {
         let url = self.config.path_url(path);
         let builder = self.client.request(Method::PUT, url.as_str());
@@ -783,7 +796,8 @@ impl AzureClient {
         boundary: &str,
         paths: &[Path],
         credential: &Option<Arc<AzureCredential>>,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>> {
+        let crypto = self.crypto();
         let mut body_bytes = Vec::with_capacity(paths.len() * 2048);
 
         for (idx, path) in paths.iter().enumerate() {
@@ -799,7 +813,7 @@ impl AzureClient {
                 // Each subrequest must be authorized individually [1] and we use
                 // the CredentialExt for this.
                 // [1]: https://learn.microsoft.com/en-us/rest/api/storageservices/blob-batch?tabs=microsoft-entra-id#request-body
-                .with_azure_authorization(credential, &self.config.account)
+                .with_azure_authorization(crypto, credential, &self.config.account)?
                 .into_parts()
                 .1
                 .unwrap();
@@ -817,7 +831,7 @@ impl AzureClient {
         extend(&mut body_bytes, boundary.as_bytes());
         extend(&mut body_bytes, b"--");
         extend(&mut body_bytes, b"\r\n");
-        body_bytes
+        Ok(body_bytes)
     }
 
     pub(crate) async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
@@ -831,7 +845,7 @@ impl AzureClient {
         let random_bytes = rand::random::<[u8; 16]>(); // 128 bits
         let boundary = format!("batch_{}", BASE64_STANDARD_NO_PAD.encode(random_bytes));
 
-        let body_bytes = self.build_bulk_delete_body(&boundary, &paths, &credential);
+        let body_bytes = self.build_bulk_delete_body(&boundary, &paths, &credential)?;
 
         // Send multipart request
         let url = self.config.path_url(&Path::from("/"));
@@ -847,7 +861,7 @@ impl AzureClient {
             )
             .header(CONTENT_LENGTH, HeaderValue::from(body_bytes.len()))
             .body(body_bytes)
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .send()
@@ -901,7 +915,11 @@ impl AzureClient {
                         signed_expiry,
                         None,
                     )
-                    .sign(&Method::GET, &mut source)?;
+                    .sign(
+                        crypto_provider(self.crypto())?,
+                        &Method::GET,
+                        &mut source,
+                    )?;
                 }
                 Some(AzureCredential::BearerToken(token)) => {
                     source_authorization = Some(format!("Bearer {token}"));
@@ -935,7 +953,7 @@ impl AzureClient {
 
         let sensitive = self.config.is_sensitive(&credential);
         builder
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .idempotent(overwrite)
@@ -973,7 +991,7 @@ impl AzureClient {
             .post(url.as_str())
             .body(body)
             .query(&[("restype", "service"), ("comp", "userdelegationkey")])
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .idempotent(true)
@@ -1036,7 +1054,7 @@ impl AzureClient {
             .client
             .get(url.as_str())
             .query(&[("comp", "tags")])
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .send()
@@ -1105,7 +1123,7 @@ impl GetClient for AzureClient {
 
         let response = builder
             .with_get_options(options)
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable_request()
             .sensitive(sensitive)
             .send(ctx)
@@ -1173,7 +1191,7 @@ impl ListClient for Arc<AzureClient> {
             .get(url.as_str())
             .extensions(opts.extensions)
             .query(&query)
-            .with_azure_authorization(&credential, &self.config.account)
+            .with_azure_authorization(self.crypto(), &credential, &self.config.account)?
             .retryable(&self.config.retry_config)
             .sensitive(sensitive)
             .send()
@@ -1468,8 +1486,7 @@ mod tests {
     <NextMarker />
 </EnumerationResults>";
 
-        let mut _list_blobs_response_internal: ListResultInternal =
-            quick_xml::de::from_str(S).unwrap();
+        let _list_blobs_response_internal: ListResultInternal = quick_xml::de::from_str(S).unwrap();
     }
 
     #[test]
@@ -1588,15 +1605,17 @@ mod tests {
             account: "testaccount".to_string(),
             container: "testcontainer".to_string(),
             credentials: credential_provider,
+            crypto: None,
             service: "http://example.com".try_into().unwrap(),
             retry_config: Default::default(),
             is_emulator: false,
             skip_signature: false,
             disable_tagging: false,
             client_options: Default::default(),
-            encryption_headers: AzureEncryptionHeaders::try_new(Some(
-                BASE64_STANDARD.encode([7_u8; 32]),
-            ))
+            encryption_headers: AzureEncryptionHeaders::try_new(
+                None,
+                Some(BASE64_STANDARD.encode([7_u8; 32])),
+            )
             .unwrap(),
         };
 
@@ -1607,7 +1626,9 @@ mod tests {
 
         let boundary = "batch_statictestboundary".to_string();
 
-        let body_bytes = client.build_bulk_delete_body(&boundary, paths, &credential);
+        let body_bytes = client
+            .build_bulk_delete_body(&boundary, paths, &credential)
+            .unwrap();
 
         // Replace Date header value with a static date
         let re = Regex::new("Date:[^\r]+").unwrap();
@@ -1660,7 +1681,7 @@ Authorization: Bearer static-token\r
     #[test]
     fn test_azure_encryption_headers_debug_redacts_key() {
         let encryption_key = BASE64_STANDARD.encode([7_u8; 32]);
-        let headers = AzureEncryptionHeaders::try_new(Some(encryption_key.clone())).unwrap();
+        let headers = AzureEncryptionHeaders::try_new(None, Some(encryption_key.clone())).unwrap();
         let encryption_key_sha256 = headers.encryption_key_sha256.clone().unwrap();
 
         let debug = format!("{headers:?}");
@@ -1674,7 +1695,7 @@ Authorization: Bearer static-token\r
     #[test]
     fn test_azure_sensitive_headers_redact_client_request_debug() {
         let encryption_key = BASE64_STANDARD.encode([7_u8; 32]);
-        let headers = AzureEncryptionHeaders::try_new(Some(encryption_key.clone())).unwrap();
+        let headers = AzureEncryptionHeaders::try_new(None, Some(encryption_key.clone())).unwrap();
         let encryption_key_sha256 = headers.encryption_key_sha256.clone().unwrap();
         let copy_source = "http://example.com/source.txt?sig=secret-source-sas";
         let source_authorization = "Bearer static-token";

@@ -42,12 +42,6 @@ where
     Ok(chrono::TimeZone::from_utc_datetime(&chrono::Utc, &naive))
 }
 
-#[cfg(any(feature = "aws-base", feature = "azure-base"))]
-pub(crate) fn hmac_sha256(secret: impl AsRef<[u8]>, bytes: impl AsRef<[u8]>) -> ring::hmac::Tag {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_ref());
-    ring::hmac::sign(&key, bytes.as_ref())
-}
-
 /// Collect a stream into [`Bytes`] avoiding copying in the event of a single chunk
 pub async fn collect_bytes<S, E>(mut stream: S, size_hint: Option<u64>) -> Result<Bytes, E>
 where
@@ -309,9 +303,13 @@ pub(crate) const STRICT_ENCODE_SET: percent_encoding::AsciiSet = percent_encodin
 
 /// Computes the SHA256 digest of `body` returned as a hex encoded string
 #[cfg(any(feature = "aws-base", feature = "gcp-base"))]
-pub(crate) fn hex_digest(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    hex_encode(digest.as_ref())
+pub(crate) fn hex_digest(
+    crypto: &dyn crate::client::CryptoProvider,
+    bytes: &[u8],
+) -> Result<String> {
+    let mut ctx = crypto.digest(crate::client::DigestAlgorithm::Sha256)?;
+    ctx.update(bytes);
+    Ok(hex_encode(ctx.finish()?))
 }
 
 /// Returns `bytes` as a lower-case hex encoded string

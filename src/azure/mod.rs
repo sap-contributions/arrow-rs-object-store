@@ -42,9 +42,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-use crate::client::CredentialProvider;
 use crate::client::get::GetClientExt;
 use crate::client::list::{ListClient, ListClientExt};
+use crate::client::{CredentialProvider, crypto_provider};
 pub use credential::{AzureAccessKey, AzureAuthorizer, authority_hosts};
 
 mod builder;
@@ -224,9 +224,10 @@ impl Signer for MicrosoftAzure {
             });
         }
 
+        let crypto = crypto_provider(self.client.crypto())?;
         let mut url = self.path_url(path);
         let signer = self.client.signer(expires_in).await?;
-        signer.sign(&method, &mut url)?;
+        signer.sign(crypto, &method, &mut url)?;
         Ok(url)
     }
 
@@ -242,11 +243,12 @@ impl Signer for MicrosoftAzure {
             });
         }
 
+        let crypto = crypto_provider(self.client.crypto())?;
         let mut urls = Vec::with_capacity(paths.len());
         let signer = self.client.signer(expires_in).await?;
         for path in paths {
             let mut url = self.path_url(path);
-            signer.sign(&method, &mut url)?;
+            signer.sign(crypto, &method, &mut url)?;
             urls.push(url);
         }
         Ok(urls)
