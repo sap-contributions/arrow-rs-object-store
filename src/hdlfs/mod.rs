@@ -23,15 +23,16 @@ use crate::client::parts::Parts;
 use crate::hdlfs::client::SAPHdlfsClient;
 use crate::multipart::{MultipartStore, PartId};
 use crate::{
-    path::Path, GetOptions, GetRange, GetResult, ListResult, MultipartId, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    UploadPart,
+    path::Path, CopyMode, CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartId,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result, UploadPart,
 };
 use async_trait::async_trait;
 pub use builder::SAPHdlfsBuilder;
 pub use builder::SAPHdlfsConfigKey;
 pub use credential::SAPHdlfsCredential;
-use futures::stream::BoxStream;
+use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -132,17 +133,21 @@ impl ObjectStore for SAPHdlfs {
         result
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let start = std::time::Instant::now();
-        let result = self.client.delete_request(location, &()).await;
-        let duration = start.elapsed();
-        trace_api_call!(
-            self,
-            "<< delete end, path: {}, took: {} ms",
-            location,
-            duration.as_millis()
-        );
-        result
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let client = Arc::clone(&self.client);
+        locations
+            .then(move |location| {
+                let client = Arc::clone(&client);
+                async move {
+                    let location = location?;
+                    client.delete_request(&location, &()).await?;
+                    Ok(location)
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -166,29 +171,17 @@ impl ObjectStore for SAPHdlfs {
         result
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         let start = std::time::Instant::now();
-        let result = self.client.copy_request(from, to, true).await;
+        let overwrite = matches!(options.mode, CopyMode::Overwrite);
+        let result = self.client.copy_request(from, to, overwrite).await;
         let duration = start.elapsed();
         trace_api_call!(
             self,
-            "<< copy end, from: {}, to: {}, took: {} ms",
+            "<< copy_opts end, from: {}, to: {}, overwrite: {}, took: {} ms",
             from,
             to,
-            duration.as_millis()
-        );
-        result
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let start = std::time::Instant::now();
-        let result = self.client.copy_request(from, to, false).await;
-        let duration = start.elapsed();
-        trace_api_call!(
-            self,
-            "<< copy_if_not_exists end, from: {}, to: {}, took: {} ms",
-            from,
-            to,
+            overwrite,
             duration.as_millis()
         );
         result
