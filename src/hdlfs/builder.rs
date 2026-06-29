@@ -29,11 +29,7 @@ use std::time::Duration;
 use url::Url;
 
 use crate::client::HttpClient;
-use ring::signature::RsaKeyPair;
-use rustls_pemfile::Item;
 use serde::{Deserialize, Serialize};
-use std::io::BufReader;
-use std::io::Cursor;
 use std::str::FromStr;
 
 #[derive(Debug, thiserror::Error)]
@@ -423,25 +419,11 @@ impl SAPHdlfsBuilder {
             self.parse_endpoint(&self.endpoint.clone())?;
         }
 
-        // Read and parse private key (support PKCS#1 and PKCS#8)
+        // Read cert + key; rustls (via reqwest Identity) accepts PKCS#8 and PKCS#1 (RSA).
         let cert_pem = fs::read(&self.credential.cert_path)
             .map_err(|e| Error::InvalidCertificate(format!("Failed to read cert: {e}")))?;
         let key_pem = fs::read(&self.credential.key_path)
             .map_err(|e| Error::InvalidKey(format!("Failed to read key: {e}")))?;
-        let mut cursor = Cursor::new(&key_pem);
-        let mut reader = BufReader::new(&mut cursor);
-
-        let key_der = match rustls_pemfile::read_one(&mut reader)
-            .map_err(|e| Error::InvalidKey(format!("Failed to parse PEM: {e}")))?
-        {
-            Some(Item::Pkcs8Key(key)) => key.secret_pkcs8_der().to_vec(),
-            Some(Item::Pkcs1Key(key)) => key.secret_pkcs1_der().to_vec(),
-            _ => return Err(Error::InvalidKey("Unsupported key type".to_string()).into()),
-        };
-
-        RsaKeyPair::from_pkcs8(&key_der).map_err(|_| {
-            Error::InvalidKey("Only PKCS#8 or PKCS#1 private keys are supported".to_string())
-        })?;
 
         // Combine cert and key for reqwest Identity
         let mut identity_pem = cert_pem.clone();
